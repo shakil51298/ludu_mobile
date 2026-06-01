@@ -373,6 +373,10 @@ function GameScreen({
     inputRange: [0, 0.5, 1],
     outputRange: [0.64, 1, 0.64],
   });
+  const arrowShift = activePulse.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: [0, -8, 0],
+  });
   const rollingRotate = rollMotion.interpolate({
     inputRange: [0, 1],
     outputRange: ['0deg', '720deg'],
@@ -451,7 +455,7 @@ function GameScreen({
             <GameDicePad
               activeGlow={activeGlow}
               activePlayerId={activePlayer.id}
-              activeScale={activeScale}
+              arrowShift={arrowShift}
               game={game}
               isCpuTurn={isCpuTurn}
               isRolling={isRolling}
@@ -481,7 +485,7 @@ function GameScreen({
             <GameDicePad
               activeGlow={activeGlow}
               activePlayerId={activePlayer.id}
-              activeScale={activeScale}
+              arrowShift={arrowShift}
               game={game}
               isCpuTurn={isCpuTurn}
               isRolling={isRolling}
@@ -503,7 +507,7 @@ function GameScreen({
 function GameDicePad({
   activeGlow,
   activePlayerId,
-  activeScale,
+  arrowShift,
   game,
   isCpuTurn,
   isRolling,
@@ -516,7 +520,7 @@ function GameDicePad({
 }: {
   activeGlow: Animated.AnimatedInterpolation<string | number>;
   activePlayerId: PlayerId;
-  activeScale: Animated.AnimatedInterpolation<string | number>;
+  arrowShift: Animated.AnimatedInterpolation<string | number>;
   game: Game;
   isCpuTurn: boolean;
   isRolling: boolean;
@@ -538,14 +542,19 @@ function GameDicePad({
     <Animated.View
       style={[
         styles.playerDicePad,
+        playerId === 'blue' ? styles.blueDicePadOffset : null,
         {
           backgroundColor: player.color,
           borderColor: isActive ? '#FFFFFF' : player.laneColor,
           opacity: isActive ? activeGlow : isInGame ? 0.88 : 0.38,
-          transform: isActive ? [{ scale: activeScale }] : [{ scale: 1 }],
         },
       ]}
     >
+      {isActive && (
+        <Animated.View pointerEvents="none" style={[styles.activeDiceArrow, { transform: [{ translateY: arrowShift }] }]}>
+          <Text style={styles.activeDiceArrowText}>↓</Text>
+        </Animated.View>
+      )}
       <Pressable disabled={!canRoll} onPress={onRoll} style={styles.playerDicePressable}>
         <GlassSkin />
         <Animated.View
@@ -1643,6 +1652,25 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     right: 0,
     top: 0,
   },
+  activeDiceArrow: {
+    alignItems: 'center',
+    height: 24,
+    justifyContent: 'center',
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    top: -25,
+    zIndex: 4,
+  },
+  activeDiceArrowText: {
+    color: '#FFD84A',
+    fontSize: 26,
+    fontWeight: '900',
+    lineHeight: 28,
+    textShadowColor: '#5A3500',
+    textShadowOffset: { height: 2, width: 0 },
+    textShadowRadius: 1,
+  },
   boardCourtOverlay: {
     bottom: 0,
     left: 0,
@@ -1927,6 +1955,7 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     flexDirection: 'row',
     gap: 12,
     justifyContent: 'space-between',
+    overflow: 'visible',
   },
   diceFaceGrid: {
     flexDirection: 'row',
@@ -2650,9 +2679,9 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     borderRadius: 10,
     borderWidth: 3,
     boxShadow: '0 3px 0 rgba(255,255,255,0.32) inset, 0 -7px 0 rgba(0,0,0,0.3) inset, 0 7px 14px rgba(0,0,0,0.34)',
-    flex: 1,
-    height: 56,
-    overflow: 'hidden',
+    flexBasis: '43%',
+    height: 50,
+    overflow: 'visible',
   },
   playerDicePressable: {
     alignItems: 'center',
@@ -2672,6 +2701,10 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     textShadowColor: '#000000',
     textShadowOffset: { height: 2, width: 0 },
     textShadowRadius: 0,
+  },
+  blueDicePadOffset: {
+    flexBasis: '34%',
+    marginRight: '9%',
   },
   passModal: {
     backgroundColor: 'rgba(10, 13, 30, 0.96)',
