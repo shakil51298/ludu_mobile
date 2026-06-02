@@ -3,26 +3,32 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 import LottieView from 'lottie-react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   Animated,
   Easing,
+  Image,
   ImageBackground,
   Modal,
   Pressable,
   Text,
   useWindowDimensions,
   View,
+  type ImageStyle,
   type TextStyle,
   type ViewStyle,
 } from 'react-native';
 import {
   BOARD_SIZE,
+  FINISH_PROGRESS,
   PLAYERS,
+  SAFE_GLOBAL_INDEXES,
   buildCellMap,
   chooseCpuToken,
   createGame,
   findPlayer,
   getAutoMoveTokenId,
+  getGlobalIndex,
   getLegalTokenIds,
   getTokenCoord,
   moveToken,
@@ -33,13 +39,21 @@ import {
 } from './src/ludoEngine';
 
 const boardImage = require('./assets/boards/ludo-diagram-board.png');
+const homeBackgroundImage = require('./assets/backgrounds/ludo-perspective-home.png');
 const crownPulse = require('./assets/lottie/crown-pulse.json');
 const diceBounce = require('./assets/lottie/dice-bounce.json');
 const coinSparkle = require('./assets/lottie/coin-sparkle.json');
-const diceRollSound = require('./assets/sounds/dice-roll.wav');
+const diceRollSound = require('./assets/sounds/dice-roll-real.mp3');
 const tokenStepSound = require('./assets/sounds/token-step.wav');
+const captureSound = require('./assets/sounds/capture.wav');
+const finalHomeSound = require('./assets/sounds/final-home.wav');
+const victorySound = require('./assets/sounds/victory.wav');
+const safeStarSound = require('./assets/sounds/safe-star.wav');
 const AUTO_MOVE_PREVIEW_MS = 1050;
+const DICE_ROLL_MS = 1390;
+const DICE_TICK_MS = 72;
 const TOKEN_STEP_MS = 220;
+const KILLED_RETURN_STEP_MS = 82;
 const SAVED_GAME_KEY = 'king-ludo.saved-game.v1';
 const HOME_TABS = ['HOME', 'EVENT', 'ADDA', 'INVENTORY', 'SOCIAL'] as const;
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
@@ -50,6 +64,13 @@ type HomeTab = (typeof HOME_TABS)[number];
 type PassVariant = 'classic' | 'team';
 type TokenDesign = 'glass' | 'royal' | 'neon';
 type DiceMemory = Partial<Record<PlayerId, number>>;
+type CaptureEvent = {
+  actorTokenId: string;
+  capturedTokenIds: string[];
+  eventId: number;
+  hitDelayMs: number;
+  returnDelayMs: number;
+};
 type SavedGameSnapshot = {
   game: Game;
   gameMode: GameMode;
@@ -108,13 +129,27 @@ function useLoopAnimation(duration: number) {
 }
 
 export default function App() {
+  return (
+    <SafeAreaProvider>
+      <AppContent />
+    </SafeAreaProvider>
+  );
+}
+
+function AppContent() {
   const diceAudioPlayer = useAudioPlayer(diceRollSound);
   const tokenStepAudioPlayer = useAudioPlayer(tokenStepSound);
+  const captureAudioPlayer = useAudioPlayer(captureSound);
+  const finalHomeAudioPlayer = useAudioPlayer(finalHomeSound);
+  const victoryAudioPlayer = useAudioPlayer(victorySound);
+  const safeStarAudioPlayer = useAudioPlayer(safeStarSound);
   const [screen, setScreen] = useState<Screen>('home');
   const [gameMode, setGameMode] = useState<GameMode>('pass');
   const [playerCount, setPlayerCount] = useState(4);
   const [game, setGame] = useState(() => createGame(4));
   const [notice, setNotice] = useState('Choose a mode to start.');
+  const [captureEvent, setCaptureEvent] = useState<CaptureEvent | null>(null);
+  const [winnerCelebration, setWinnerCelebration] = useState<PlayerId | null>(null);
   const [savedGamePrompt, setSavedGamePrompt] = useState<SavedGameSnapshot | null>(null);
   const [storageReady, setStorageReady] = useState(false);
   const [passSetup, setPassSetup] = useState<PassSetup>({
@@ -159,6 +194,8 @@ export default function App() {
     setPlayerCount(count);
     setPassSetup(setup);
     setGame(createGame(count, firstPlayer));
+    setCaptureEvent(null);
+    setWinnerCelebration(null);
     setScreen('game');
     setNotice(
       mode === 'computer'
@@ -172,6 +209,8 @@ export default function App() {
     setPlayerCount(snapshot.playerCount);
     setPassSetup(snapshot.passSetup);
     setGame(snapshot.game);
+    setCaptureEvent(null);
+    setWinnerCelebration(snapshot.game.winner);
     setScreen('game');
     setSavedGamePrompt(null);
     setNotice('Last match continued.');
@@ -182,16 +221,87 @@ export default function App() {
     setSavedGamePrompt(null);
     setScreen('home');
     setGame(createGame(4));
+    setCaptureEvent(null);
+    setWinnerCelebration(null);
     setNotice('Old match cleared. Choose a mode to start.');
   }
 
+  const playSound = useCallback((player: ReturnType<typeof useAudioPlayer>) => {
+    player.seekTo(0).then(() => player.play()).catch(() => player.play());
+  }, []);
+
   const playDiceRollSound = useCallback(() => {
-    diceAudioPlayer.seekTo(0).then(() => diceAudioPlayer.play()).catch(() => diceAudioPlayer.play());
-  }, [diceAudioPlayer]);
+    playSound(diceAudioPlayer);
+  }, [diceAudioPlayer, playSound]);
 
   const playTokenStepSound = useCallback(() => {
-    tokenStepAudioPlayer.seekTo(0).then(() => tokenStepAudioPlayer.play()).catch(() => tokenStepAudioPlayer.play());
-  }, [tokenStepAudioPlayer]);
+    playSound(tokenStepAudioPlayer);
+  }, [playSound, tokenStepAudioPlayer]);
+
+  const playMoveResultSounds = useCallback((before: Game, after: Game, tokenId: string) => {
+    if (before === after) return;
+
+    const movingBefore = before.tokens.find((token) => token.id === tokenId);
+    const movingAfter = after.tokens.find((token) => token.id === tokenId);
+    const captured = before.tokens.some((token) => {
+      const nextToken = after.tokens.find((candidate) => candidate.id === token.id);
+      return (
+        token.playerId !== movingBefore?.playerId &&
+        token.progress >= 0 &&
+        token.progress < FINISH_PROGRESS &&
+        nextToken?.progress === -1
+      );
+    });
+    const reachedFinalHome = movingBefore?.progress !== FINISH_PROGRESS && movingAfter?.progress === FINISH_PROGRESS;
+    const landedOnSafeStar = Boolean(
+      movingAfter &&
+        movingAfter.progress >= 0 &&
+        movingAfter.progress < 52 &&
+        SAFE_GLOBAL_INDEXES.has(getGlobalIndex(movingAfter)),
+    );
+
+    if (captured) playSound(captureAudioPlayer);
+    if (landedOnSafeStar) setTimeout(() => playSound(safeStarAudioPlayer), captured ? 220 : 0);
+    if (reachedFinalHome) setTimeout(() => playSound(finalHomeAudioPlayer), captured ? 360 : 0);
+    if (after.winner && after.winner !== before.winner) {
+      setWinnerCelebration(after.winner);
+      setTimeout(() => playSound(victoryAudioPlayer), reachedFinalHome || captured ? 700 : 0);
+    }
+  }, [captureAudioPlayer, finalHomeAudioPlayer, playSound, safeStarAudioPlayer, victoryAudioPlayer]);
+
+  const applyMove = useCallback((tokenId: string) => {
+    setGame((current) => {
+      const next = moveToken(current, tokenId);
+      const movingBefore = current.tokens.find((token) => token.id === tokenId);
+      const movingAfter = next.tokens.find((token) => token.id === tokenId);
+      const capturedTokenIds = current.tokens
+        .filter((token) => {
+          const nextToken = next.tokens.find((candidate) => candidate.id === token.id);
+          return (
+            token.playerId !== movingBefore?.playerId &&
+            token.progress >= 0 &&
+            token.progress < FINISH_PROGRESS &&
+            nextToken?.progress === -1
+          );
+        })
+        .map((token) => token.id);
+
+      if (capturedTokenIds.length && movingBefore && movingAfter) {
+        const travelSteps = Math.max(1, movingAfter.progress - movingBefore.progress);
+        const hitDelayMs = travelSteps * TOKEN_STEP_MS + 120;
+        setCaptureEvent({
+          actorTokenId: tokenId,
+          capturedTokenIds,
+          eventId: Date.now(),
+          hitDelayMs,
+          returnDelayMs: hitDelayMs + 380,
+        });
+      }
+
+      playMoveResultSounds(current, next, tokenId);
+      return next;
+    });
+  }, [playMoveResultSounds]);
 
   if (screen === 'game') {
     return (
@@ -199,10 +309,11 @@ export default function App() {
         <GameScreen
           game={game}
           gameMode={gameMode}
+          captureEvent={captureEvent}
           onDiceRollSound={playDiceRollSound}
           passSetup={passSetup}
           onBack={() => setScreen('home')}
-          onMove={(tokenId) => setGame((current) => moveToken(current, tokenId))}
+          onMove={applyMove}
           onRoll={(forcedRoll) => {
             setGame((current) => {
               const rolled = rollDice(current, forcedRoll);
@@ -210,7 +321,7 @@ export default function App() {
 
               if (autoMoveTokenId) {
                 setTimeout(() => {
-                  setGame((latest) => moveToken(latest, autoMoveTokenId));
+                  applyMove(autoMoveTokenId);
                 }, AUTO_MOVE_PREVIEW_MS);
               }
 
@@ -223,6 +334,11 @@ export default function App() {
           onContinue={() => savedGamePrompt && continueSavedGame(savedGamePrompt)}
           onNewGame={startFreshFromSavedPrompt}
           snapshot={savedGamePrompt}
+        />
+        <WinningModal
+          onClose={() => setWinnerCelebration(null)}
+          onNewGame={() => startGame(gameMode, playerCount, passSetup)}
+          winnerId={winnerCelebration}
         />
       </>
     );
@@ -256,6 +372,7 @@ function HomeScreen({
   onComputer: () => void;
   onPass: (setup: PassSetup) => void;
 }) {
+  const insets = useSafeAreaInsets();
   const [activeTab, setActiveTab] = useState<HomeTab>('HOME');
   const [showNotifications, setShowNotifications] = useState(false);
   const [showPassSetup, setShowPassSetup] = useState(false);
@@ -280,17 +397,21 @@ function HomeScreen({
     inputRange: [0, 1],
     outputRange: [-220, 220],
   });
+  const topInset = Math.max(insets.top, 22);
+  const bottomInset = Math.max(insets.bottom, 18);
+  const topBarHeight = topInset + 54;
+  const bottomTabsHeight = bottomInset + 58;
 
   return (
     <View style={styles.homeRoot}>
       <StatusBar style="light" />
-      <BoardPattern />
-      <View pointerEvents="none" style={styles.sparkleCurtain}>
+      <HomeArtBackground />
+      <View pointerEvents="none" style={[styles.sparkleCurtain, { bottom: bottomTabsHeight, top: topBarHeight }]}>
         <Animated.View style={[styles.shineBeam, { transform: [{ translateX: shineX }, { rotate: '-14deg' }] }]} />
         <LottieView autoPlay loop source={coinSparkle} style={styles.coinBurstLeft} />
         <LottieView autoPlay loop source={coinSparkle} style={styles.coinBurstRight} />
       </View>
-      <View style={styles.topBar}>
+      <View style={[styles.topBar, { minHeight: topBarHeight, paddingTop: topInset + 3 }]}>
         <View style={styles.avatarFrame}>
           <View style={styles.avatarFace}>
             <Text style={styles.avatarText}>P</Text>
@@ -311,13 +432,13 @@ function HomeScreen({
         <TopIcon label="SHOP" onPress={() => onComingSoon('Shop preview: coins, dice skins, frames, and table themes.')} />
       </View>
 
-      <View style={styles.sideRail}>
+      <View style={[styles.sideRail, { top: topBarHeight + 16 }]}>
         <SmallBadge title="STARTER" subtitle="PACK" />
         <RoundBadge title="K" />
         <SmallBadge title="FREE" subtitle="COINS" />
       </View>
 
-      <View style={styles.homeContent}>
+      <View style={[styles.homeContent, { paddingBottom: bottomTabsHeight + 8, paddingTop: topBarHeight + 18 }]}>
         <View style={styles.helpBubble}>
           <GlassSkin />
           <Text style={styles.helpText}>?</Text>
@@ -372,12 +493,6 @@ function HomeScreen({
           />
         </View>
 
-        <AnimatedBabyField />
-
-        {showNotifications && <NotificationPanel />}
-
-        <HomeTabPanel activeTab={activeTab} />
-
         <View style={styles.modeGrid}>
           <ModeCard
             icon="GLOBE"
@@ -399,6 +514,12 @@ function HomeScreen({
           />
         </View>
 
+        <AnimatedBabyField />
+
+        {showNotifications && <NotificationPanel />}
+
+        <HomeTabPanel activeTab={activeTab} />
+
         <View style={styles.tournamentRow}>
           <GiftButton label="7" />
           <View style={styles.tournamentBadge}>
@@ -415,7 +536,7 @@ function HomeScreen({
         </View>
       </View>
 
-      <View style={styles.bottomTabs}>
+      <View style={[styles.bottomTabs, { minHeight: bottomTabsHeight, paddingBottom: bottomInset }]}>
         {HOME_TABS.map((tab, index) => (
           <Pressable
             key={tab}
@@ -447,6 +568,7 @@ function HomeScreen({
 }
 
 function GameScreen({
+  captureEvent,
   game,
   gameMode,
   onDiceRollSound,
@@ -456,6 +578,7 @@ function GameScreen({
   onRoll,
   onTokenStepSound,
 }: {
+  captureEvent: CaptureEvent | null;
   game: Game;
   gameMode: GameMode;
   onDiceRollSound: () => void;
@@ -506,8 +629,8 @@ function GameScreen({
     setRollingPlayerId(rollingFor);
     rollMotion.setValue(0);
     Animated.timing(rollMotion, {
-      duration: 760,
-      easing: Easing.out(Easing.cubic),
+      duration: DICE_ROLL_MS,
+      easing: Easing.out(Easing.quad),
       toValue: 1,
       useNativeDriver: true,
     }).start();
@@ -515,8 +638,8 @@ function GameScreen({
     const interval = setInterval(() => {
       ticks += 1;
       setRollingValue(Math.floor(Math.random() * 6) + 1);
-      if (ticks >= 10) clearInterval(interval);
-    }, 70);
+      if (ticks >= Math.floor(DICE_ROLL_MS / DICE_TICK_MS)) clearInterval(interval);
+    }, DICE_TICK_MS);
 
     setTimeout(() => {
       clearInterval(interval);
@@ -524,7 +647,7 @@ function GameScreen({
       setLastDiceByPlayer((current) => ({ ...current, [rollingFor]: finalDice }));
       setRollingPlayerId(null);
       onRoll(finalDice);
-    }, 780);
+    }, DICE_ROLL_MS);
   }
 
   useEffect(() => {
@@ -584,6 +707,7 @@ function GameScreen({
           <LudoBoard
             activePlayerId={activePlayer.id}
             boardWidth={boardWidth}
+            captureEvent={captureEvent}
             cellMap={cellMap}
             cellSize={cellSize}
             legalTokenIds={legalTokenIds}
@@ -719,6 +843,7 @@ function DiceFace({ value }: { value: number }) {
 function LudoBoard({
   activePlayerId,
   boardWidth,
+  captureEvent,
   cellMap,
   cellSize,
   legalTokenIds,
@@ -728,6 +853,7 @@ function LudoBoard({
 }: {
   activePlayerId: PlayerId;
   boardWidth: number;
+  captureEvent: CaptureEvent | null;
   cellMap: Map<string, Token[]>;
   cellSize: number;
   legalTokenIds: Set<string>;
@@ -782,6 +908,7 @@ function LudoBoard({
           <BoardToken
             isHome={token.progress === -1}
             isLegal={isLegal}
+            captureEvent={captureEvent}
             key={token.id}
             onPress={() => onMove(token.id)}
             onStepSound={onTokenStepSound}
@@ -799,6 +926,7 @@ function LudoBoard({
 }
 
 function BoardToken({
+  captureEvent,
   isHome,
   isLegal,
   onPress,
@@ -810,6 +938,7 @@ function BoardToken({
   token,
   visibleOpacity,
 }: {
+  captureEvent: CaptureEvent | null;
   isHome: boolean;
   isLegal: boolean;
   onPress: () => void;
@@ -824,6 +953,7 @@ function BoardToken({
   const translateX = useRef(new Animated.Value(position.left)).current;
   const translateY = useRef(new Animated.Value(position.top)).current;
   const pop = useRef(new Animated.Value(1)).current;
+  const killHit = useRef(new Animated.Value(1)).current;
   const legalPulse = useRef(new Animated.Value(1)).current;
   const legalGlow = useRef(new Animated.Value(0)).current;
   const previousProgress = useRef(token.progress);
@@ -875,14 +1005,49 @@ function BoardToken({
   }, [isLegal, legalGlow, legalPulse]);
 
   useEffect(() => {
+    if (!captureEvent || captureEvent.actorTokenId !== token.id) return;
+
+    const hitTimer = setTimeout(() => {
+      Animated.sequence([
+        Animated.timing(killHit, {
+          duration: 90,
+          easing: Easing.out(Easing.back(1.8)),
+          toValue: 1.46,
+          useNativeDriver: true,
+        }),
+        Animated.timing(killHit, {
+          duration: 110,
+          easing: Easing.inOut(Easing.quad),
+          toValue: 0.92,
+          useNativeDriver: true,
+        }),
+        Animated.timing(killHit, {
+          duration: 130,
+          easing: Easing.out(Easing.quad),
+          toValue: 1,
+          useNativeDriver: true,
+        }),
+      ]).start();
+    }, captureEvent.hitDelayMs);
+
+    return () => clearTimeout(hitTimer);
+  }, [captureEvent, killHit, token.id]);
+
+  useEffect(() => {
     const priorProgress = previousProgress.current;
     const didAdvance = token.progress > priorProgress && priorProgress >= -1;
+    const wasCaptured = token.progress === -1 && priorProgress >= 0 && captureEvent?.capturedTokenIds.includes(token.id);
+    const returnDelayMs = wasCaptured ? captureEvent?.returnDelayMs ?? 0 : 0;
     const stepSoundTimers = didAdvance
       ? Array.from({ length: token.progress - priorProgress }, (_, index) =>
           setTimeout(onStepSound, index * TOKEN_STEP_MS),
         )
+      : wasCaptured
+        ? Array.from({ length: priorProgress + 1 }, (_, index) =>
+            setTimeout(onStepSound, returnDelayMs + index * KILLED_RETURN_STEP_MS),
+          )
       : [];
-    const stepAnimations = didAdvance
+    const forwardStepAnimations = didAdvance
       ? Array.from({ length: token.progress - priorProgress }, (_, index) => priorProgress + index + 1).flatMap(
           (progress) => {
             const [row, col] = getTokenCoord({ ...token, progress });
@@ -907,20 +1072,45 @@ function BoardToken({
           },
         )
       : [];
+    const reverseStepAnimations = wasCaptured
+      ? [
+          Animated.delay(returnDelayMs),
+          ...Array.from({ length: priorProgress + 1 }, (_, index) => priorProgress - index).map((progress) => {
+            const [row, col] = getTokenCoord({ ...token, progress });
+            const stepPosition = getStackedTokenPosition(row, col, 0, 1, cellSize, false);
+
+            return Animated.parallel([
+              Animated.timing(translateX, {
+                duration: KILLED_RETURN_STEP_MS,
+                easing: Easing.inOut(Easing.quad),
+                toValue: stepPosition.left,
+                useNativeDriver: true,
+              }),
+              Animated.timing(translateY, {
+                duration: KILLED_RETURN_STEP_MS,
+                easing: Easing.inOut(Easing.quad),
+                toValue: stepPosition.top,
+                useNativeDriver: true,
+              }),
+            ]);
+          }),
+        ]
+      : [];
 
     previousProgress.current = token.progress;
 
     const movementAnimation = Animated.sequence([
-      ...stepAnimations,
+      ...forwardStepAnimations,
+      ...reverseStepAnimations,
       Animated.parallel([
         Animated.timing(translateX, {
-          duration: didAdvance ? 110 : 260,
+          duration: didAdvance ? 110 : wasCaptured ? 180 : 260,
           easing: Easing.out(Easing.cubic),
           toValue: position.left,
           useNativeDriver: true,
         }),
         Animated.timing(translateY, {
-          duration: didAdvance ? 110 : 260,
+          duration: didAdvance ? 110 : wasCaptured ? 180 : 260,
           easing: Easing.out(Easing.cubic),
           toValue: position.top,
           useNativeDriver: true,
@@ -948,7 +1138,7 @@ function BoardToken({
       stepSoundTimers.forEach(clearTimeout);
       movementAnimation.stop();
     };
-  }, [cellSize, onStepSound, pop, position.left, position.top, token.id, token.index, token.playerId, token.progress, translateX, translateY]);
+  }, [captureEvent, cellSize, onStepSound, pop, position.left, position.top, token.id, token.index, token.playerId, token.progress, translateX, translateY]);
 
   return (
     <AnimatedPressable
@@ -963,7 +1153,7 @@ function BoardToken({
           backgroundColor: playerColor,
           height: position.size,
           opacity: visibleOpacity,
-          transform: [{ translateX }, { translateY }, { scale: Animated.multiply(pop, legalPulse) }],
+          transform: [{ translateX }, { translateY }, { scale: Animated.multiply(Animated.multiply(pop, legalPulse), killHit) }],
           width: position.size,
         },
         isLegal ? styles.legalToken : null,
@@ -1122,6 +1312,16 @@ function BoardPattern() {
           <View style={[styles.patternDot, { alignSelf: 'flex-end' }]} />
         </View>
       ))}
+    </View>
+  );
+}
+
+function HomeArtBackground() {
+  return (
+    <View pointerEvents="none" style={styles.homeArtBackground}>
+      <Image blurRadius={6} resizeMode="cover" source={homeBackgroundImage} style={styles.homeArtImage as ImageStyle} />
+      <View style={styles.homeArtBlueWash} />
+      <View style={styles.homeArtVignette} />
     </View>
   );
 }
@@ -1524,6 +1724,54 @@ function SavedGameModal({
   );
 }
 
+function WinningModal({
+  onClose,
+  onNewGame,
+  winnerId,
+}: {
+  onClose: () => void;
+  onNewGame: () => void;
+  winnerId: PlayerId | null;
+}) {
+  const pulse = useLoopAnimation(1350);
+  const scale = pulse.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: [1, 1.06, 1],
+  });
+  const winner = winnerId ? findPlayer(winnerId) : null;
+
+  if (!winner) return null;
+
+  return (
+    <Modal animationType="fade" transparent visible onRequestClose={onClose}>
+      <View style={styles.modalBackdrop}>
+        <View style={styles.modalBlurLayer} />
+        <Animated.View style={[styles.winningModal, { transform: [{ scale }] }]}>
+          <GlassSkin />
+          <LottieView autoPlay loop source={coinSparkle} style={styles.winningCoinLeft} />
+          <LottieView autoPlay loop source={coinSparkle} style={styles.winningCoinRight} />
+          <LottieView autoPlay loop source={crownPulse} style={styles.winningCrown} />
+          <Text selectable style={styles.winningTitle}>WINNER!</Text>
+          <View style={[styles.winnerColorBadge, { backgroundColor: winner.color, borderColor: winner.laneColor }]}>
+            <GlassSkin />
+            <TokenStar color={winner.color} />
+          </View>
+          <Text selectable style={styles.winningName}>{winner.name} PLAYER</Text>
+          <Text selectable style={styles.winningSubtitle}>All four guti reached final home.</Text>
+          <Pressable onPress={onNewGame} style={styles.winningPlayAgainButton}>
+            <GlassSkin />
+            <Text style={styles.winningPlayAgainText}>PLAY AGAIN</Text>
+          </Pressable>
+          <Pressable onPress={onClose} style={styles.winningCloseButton}>
+            <GlassSkin />
+            <Text style={styles.winningCloseText}>CLOSE</Text>
+          </Pressable>
+        </Animated.View>
+      </View>
+    </Modal>
+  );
+}
+
 function TokenDesignPreview({ color, design }: { color: string; design: TokenDesign }) {
   return (
     <View
@@ -1700,7 +1948,7 @@ const cardShadow = '0 3px 0 rgba(255, 255, 255, 0.35) inset, 0 -7px 0 rgba(75, 4
 const blueGlassShadow = '0 2px 0 rgba(255,255,255,0.35) inset, 0 -5px 0 rgba(0, 36, 104, 0.42) inset, 0 5px 0 rgba(0, 24, 78, 0.65), 0 9px 16px rgba(0, 0, 0, 0.28)';
 const yellowGlassShadow = '0 2px 0 rgba(255,255,255,0.5) inset, 0 -5px 0 rgba(156, 93, 0, 0.42) inset, 0 5px 0 rgba(91, 61, 10, 0.9), 0 9px 16px rgba(0, 0, 0, 0.26)';
 
-const styles: Record<string, ViewStyle | TextStyle> = {
+const styles: Record<string, ImageStyle | ViewStyle | TextStyle> = {
   activeBottomTab: {
     backgroundColor: 'rgba(75, 190, 255, 0.72)',
   },
@@ -1788,10 +2036,10 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     borderRadius: 18,
     borderWidth: 3,
     boxShadow: '0 3px 0 rgba(255,255,255,0.3) inset, 0 -8px 0 rgba(0, 89, 37, 0.36) inset, 0 7px 0 rgba(0, 50, 30, 0.64), 0 13px 18px rgba(0,0,0,0.28)',
-    height: 126,
+    height: 86,
     justifyContent: 'center',
     overflow: 'hidden',
-    width: '88%',
+    width: '82%',
   },
   babyHead: {
     alignItems: 'center',
@@ -1855,27 +2103,35 @@ const styles: Record<string, ViewStyle | TextStyle> = {
   },
   activeDiceArrow: {
     alignItems: 'center',
-    height: 48,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(224, 169, 21, 0.94)',
+    borderColor: '#FFF4A8',
+    borderRadius: 999,
+    borderWidth: 3,
+    boxShadow: '0 4px 0 rgba(255,255,255,0.45) inset, 0 -9px 0 rgba(96, 57, 0, 0.38) inset, 0 7px 0 rgba(73, 42, 0, 0.82), 0 0 20px rgba(255, 228, 86, 0.75)',
+    height: 70,
     justifyContent: 'center',
-    left: 0,
+    left: '50%',
+    marginLeft: -36,
+    overflow: 'hidden',
     position: 'absolute',
-    right: 0,
+    width: 72,
     zIndex: 4,
   },
   topActiveDiceArrow: {
-    top: -52,
+    top: -78,
   },
   bottomActiveDiceArrow: {
-    bottom: -52,
+    bottom: -78,
   },
   activeDiceArrowText: {
-    color: '#FFD84A',
-    fontSize: 48,
+    color: '#FFF6B0',
+    fontSize: 62,
     fontWeight: '900',
-    lineHeight: 50,
+    lineHeight: 65,
     textShadowColor: '#5A3500',
-    textShadowOffset: { height: 3, width: 0 },
-    textShadowRadius: 2,
+    textShadowOffset: { height: 5, width: 0 },
+    textShadowRadius: 0,
   },
   boardCourtOverlay: {
     bottom: 0,
@@ -1956,9 +2212,9 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     flex: 1,
     gap: 2,
     justifyContent: 'center',
-    margin: 4,
+    margin: 3,
     overflow: 'hidden',
-    paddingVertical: 8,
+    paddingVertical: 5,
   },
   bottomTabs: {
     backgroundColor: '#0753AE',
@@ -2467,16 +2723,16 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     borderRadius: 9,
     borderWidth: 3,
     boxShadow: yellowGlassShadow,
-    height: 46,
+    height: 36,
     justifyContent: 'center',
     overflow: 'hidden',
-    width: 54,
+    width: 44,
   },
   helpText: {
     color: '#143E87',
-    fontSize: 32,
+    fontSize: 24,
     fontWeight: '900',
-    lineHeight: 34,
+    lineHeight: 27,
   },
   heroDiceLottie: {
     height: 94,
@@ -2488,12 +2744,42 @@ const styles: Record<string, ViewStyle | TextStyle> = {
   heroLogo: {
     alignItems: 'center',
   },
+  homeArtBackground: {
+    bottom: 0,
+    left: 0,
+    overflow: 'hidden',
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  },
+  homeArtBlueWash: {
+    backgroundColor: 'rgba(4, 36, 103, 0.38)',
+    bottom: 0,
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  },
+  homeArtImage: {
+    bottom: -22,
+    left: -22,
+    opacity: 0.96,
+    position: 'absolute',
+    right: -22,
+    top: -22,
+  },
+  homeArtVignette: {
+    backgroundColor: 'rgba(0, 8, 33, 0.16)',
+    bottom: 0,
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    top: 0,
+  },
   homeContent: {
     alignItems: 'center',
-    gap: 16,
+    gap: 8,
     paddingHorizontal: 14,
-    paddingTop: 160,
-    paddingBottom: 94,
   },
   homeRoot: {
     backgroundColor: '#0A3B8E',
@@ -2573,15 +2859,15 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     borderColor: '#FFFFFF',
     borderRadius: 999,
     borderWidth: 3,
-    height: 43,
+    height: 34,
     justifyContent: 'center',
-    width: 43,
+    width: 34,
   },
   logoLetter: {
     color: '#FFFFFF',
-    fontSize: 28,
+    fontSize: 22,
     fontWeight: '900',
-    lineHeight: 31,
+    lineHeight: 25,
     textShadowColor: '#10214B',
     textShadowOffset: { height: 1, width: 0 },
     textShadowRadius: 0,
@@ -2619,10 +2905,10 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     width: 8,
   },
   miniStage: {
-    height: 134,
+    height: 92,
     justifyContent: 'center',
     marginTop: -2,
-    width: 286,
+    width: 222,
   },
   modeBottom: {
     alignItems: 'center',
@@ -2630,7 +2916,7 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     borderBottomLeftRadius: 12,
     borderBottomRightRadius: 12,
     justifyContent: 'center',
-    minHeight: 38,
+    minHeight: 24,
     paddingHorizontal: 5,
   },
   modeCard: {
@@ -2644,24 +2930,25 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     width: '100%',
   },
   modeButtonShell: {
-    width: '30%',
+    height: 62,
+    width: '28%',
   },
   modeGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 13,
+    gap: 7,
     justifyContent: 'center',
-    width: '100%',
+    width: '88%',
   },
   modeIcon: {
     color: '#FFFFFF',
-    fontSize: 12,
+    fontSize: 10,
     fontWeight: '900',
     letterSpacing: 0.2,
   },
   modeTitle: {
     color: '#FFFFFF',
-    fontSize: 11,
+    fontSize: 9,
     fontWeight: '900',
     letterSpacing: 0.3,
     textAlign: 'center',
@@ -2674,7 +2961,7 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     backgroundColor: 'rgba(25, 159, 255, 0.78)',
     borderTopLeftRadius: 10,
     borderTopRightRadius: 10,
-    minHeight: 58,
+    minHeight: 32,
     justifyContent: 'center',
   },
   modalBackdrop: {
@@ -2728,7 +3015,7 @@ const styles: Record<string, ViewStyle | TextStyle> = {
   modalHeader: {
     alignItems: 'center',
     flexDirection: 'row',
-    gap: 12,
+    gap: 8,
     justifyContent: 'space-between',
   },
   modalNextButton: {
@@ -3007,7 +3294,7 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     flexDirection: 'row',
     gap: 12,
     justifyContent: 'center',
-    width: '94%',
+    width: '90%',
   },
   playOptionTitle: {
     color: '#FFFFFF',
@@ -3038,13 +3325,13 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     lineHeight: 18,
   },
   playersText: {
-    bottom: -22,
     color: '#49ED44',
-    fontSize: 8,
+    fontSize: 6,
     fontWeight: '800',
     left: 0,
     position: 'absolute',
     right: 0,
+    bottom: 2,
     textAlign: 'center',
   },
   playPanel: {
@@ -3164,7 +3451,7 @@ const styles: Record<string, ViewStyle | TextStyle> = {
   },
   seasonText: {
     color: '#FFD22D',
-    fontSize: 13,
+    fontSize: 11,
     fontWeight: '900',
   },
   seasonTicket: {
@@ -3175,11 +3462,11 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     borderWidth: 2,
     boxShadow: blueGlassShadow,
     flexDirection: 'row',
-    gap: 12,
-    marginTop: 4,
+    gap: 8,
+    marginTop: 0,
     overflow: 'hidden',
-    paddingHorizontal: 18,
-    paddingVertical: 10,
+    paddingHorizontal: 13,
+    paddingVertical: 7,
   },
   selectedGoldCard: {
     backgroundColor: 'rgba(71, 51, 8, 0.88)',
@@ -3288,6 +3575,122 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     textShadowOffset: { height: 2, width: 0 },
     textShadowRadius: 0,
   },
+  winnerColorBadge: {
+    alignItems: 'center',
+    alignSelf: 'center',
+    borderRadius: 999,
+    borderWidth: 4,
+    boxShadow: '0 4px 0 rgba(255,255,255,0.3) inset, 0 -9px 0 rgba(0,0,0,0.26) inset, 0 0 24px rgba(255, 228, 86, 0.55)',
+    height: 86,
+    justifyContent: 'center',
+    overflow: 'hidden',
+    width: 86,
+  },
+  winningCloseButton: {
+    alignItems: 'center',
+    alignSelf: 'center',
+    backgroundColor: 'rgba(15, 85, 184, 0.92)',
+    borderColor: '#E0A915',
+    borderRadius: 14,
+    borderWidth: 2,
+    boxShadow: blueGlassShadow,
+    justifyContent: 'center',
+    minHeight: 44,
+    overflow: 'hidden',
+    width: '58%',
+  },
+  winningCloseText: {
+    color: '#FFE456',
+    fontSize: 13,
+    fontWeight: '900',
+    letterSpacing: 1,
+    textShadowColor: '#001D55',
+    textShadowOffset: { height: 2, width: 0 },
+    textShadowRadius: 0,
+  },
+  winningCoinLeft: {
+    height: 116,
+    left: -24,
+    position: 'absolute',
+    top: 8,
+    width: 116,
+  },
+  winningCoinRight: {
+    height: 116,
+    position: 'absolute',
+    right: -24,
+    top: 8,
+    width: 116,
+  },
+  winningCrown: {
+    alignSelf: 'center',
+    height: 96,
+    marginBottom: -16,
+    width: 118,
+  },
+  winningModal: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(10, 13, 30, 0.97)',
+    borderColor: '#FFE456',
+    borderRadius: 24,
+    borderWidth: 3,
+    boxShadow: '0 4px 0 rgba(255,255,255,0.24) inset, 0 -12px 0 rgba(0,0,0,0.32) inset, 0 14px 34px rgba(0,0,0,0.55)',
+    gap: 10,
+    maxWidth: 390,
+    overflow: 'hidden',
+    padding: 18,
+    width: '100%',
+  },
+  winningName: {
+    color: '#FFE456',
+    fontSize: 20,
+    fontWeight: '900',
+    letterSpacing: 1,
+    textAlign: 'center',
+    textShadowColor: '#633B00',
+    textShadowOffset: { height: 2, width: 0 },
+    textShadowRadius: 0,
+  },
+  winningPlayAgainButton: {
+    alignItems: 'center',
+    alignSelf: 'center',
+    backgroundColor: '#E0A915',
+    borderColor: '#FFF5BD',
+    borderRadius: 15,
+    borderWidth: 2,
+    boxShadow: yellowGlassShadow,
+    justifyContent: 'center',
+    marginTop: 4,
+    minHeight: 50,
+    overflow: 'hidden',
+    width: '82%',
+  },
+  winningPlayAgainText: {
+    color: '#221700',
+    fontSize: 16,
+    fontWeight: '900',
+    letterSpacing: 1.1,
+    textShadowColor: 'rgba(255,255,255,0.35)',
+    textShadowOffset: { height: 1, width: 0 },
+    textShadowRadius: 0,
+  },
+  winningSubtitle: {
+    color: '#B8DDFF',
+    fontSize: 13,
+    fontWeight: '800',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  winningTitle: {
+    color: '#FFFFFF',
+    fontSize: 31,
+    fontWeight: '900',
+    letterSpacing: 1,
+    textAlign: 'center',
+    textShadowColor: '#E0A915',
+    textShadowOffset: { height: 3, width: 0 },
+    textShadowRadius: 0,
+  },
   shineBeam: {
     backgroundColor: 'rgba(255, 255, 255, 0.22)',
     borderRadius: 999,
@@ -3300,16 +3703,13 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     gap: 22,
     left: 8,
     position: 'absolute',
-    top: 154,
     zIndex: 3,
   },
   sparkleCurtain: {
-    bottom: 68,
     left: 0,
     overflow: 'hidden',
     position: 'absolute',
     right: 0,
-    top: 58,
   },
   tabPanel: {
     backgroundColor: 'rgba(20, 43, 120, 0.82)',
@@ -3504,7 +3904,6 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     gap: 9,
     minHeight: 58,
     paddingHorizontal: 10,
-    paddingTop: 4,
     zIndex: 4,
   },
   topIcon: {
@@ -3530,20 +3929,20 @@ const styles: Record<string, ViewStyle | TextStyle> = {
   },
   tournamentCrown: {
     color: '#FFD22D',
-    fontSize: 46,
+    fontSize: 34,
     fontWeight: '900',
-    lineHeight: 42,
+    lineHeight: 32,
   },
   tournamentRow: {
     alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginTop: 20,
-    width: '86%',
+    marginTop: 2,
+    width: '78%',
   },
   tournamentText: {
     color: '#FFD22D',
-    fontSize: 24,
+    fontSize: 17,
     fontWeight: '900',
     textShadowColor: '#10214B',
     textShadowOffset: { height: 2, width: 0 },
