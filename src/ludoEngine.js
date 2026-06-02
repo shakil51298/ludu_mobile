@@ -288,8 +288,8 @@ export function moveToken(game, tokenId) {
     .every((token) => token.progress === FINISH_PROGRESS);
   const reachedHome = nextProgress === FINISH_PROGRESS;
 
-  // Rule: only rolling a six grants another turn after the move.
-  const getsExtraTurn = game.dice === 6;
+  // Rule: rolling a six, capturing an opponent, or reaching final home grants another dice roll.
+  const getsExtraTurn = game.dice === 6 || capturedIds.length > 0 || reachedHome;
   const nextIndex = getsExtraTurn ? game.activePlayerIndex : nextActiveIndex(game);
   const nextPlayer = findPlayer(game.playerIds[nextIndex]);
   const outcome = movingToken.progress === -1
@@ -310,7 +310,7 @@ export function moveToken(game, tokenId) {
     log: [
       playerFinished
         ? `${activePlayer.name} wins the match.`
-        : `${activePlayer.name} ${outcome}${captureText}. ${nextPlayer.name} is up.`,
+        : `${activePlayer.name} ${outcome}${captureText}. ${nextPlayer.name} is up${getsExtraTurn ? ' again' : ''}.`,
       ...game.log,
     ].slice(0, 8),
   };

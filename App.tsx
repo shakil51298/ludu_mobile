@@ -1,13 +1,14 @@
 import { StatusBar } from 'expo-status-bar';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 import LottieView from 'lottie-react-native';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
   Easing,
   ImageBackground,
   Modal,
   Pressable,
-  ScrollView,
   Text,
   useWindowDimensions,
   View,
@@ -35,6 +36,11 @@ const boardImage = require('./assets/boards/ludo-diagram-board.png');
 const crownPulse = require('./assets/lottie/crown-pulse.json');
 const diceBounce = require('./assets/lottie/dice-bounce.json');
 const coinSparkle = require('./assets/lottie/coin-sparkle.json');
+const diceRollSound = require('./assets/sounds/dice-roll.wav');
+const tokenStepSound = require('./assets/sounds/token-step.wav');
+const AUTO_MOVE_PREVIEW_MS = 1050;
+const TOKEN_STEP_MS = 220;
+const SAVED_GAME_KEY = 'king-ludo.saved-game.v1';
 const HOME_TABS = ['HOME', 'EVENT', 'ADDA', 'INVENTORY', 'SOCIAL'] as const;
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
@@ -44,6 +50,35 @@ type HomeTab = (typeof HOME_TABS)[number];
 type PassVariant = 'classic' | 'team';
 type TokenDesign = 'glass' | 'royal' | 'neon';
 type DiceMemory = Partial<Record<PlayerId, number>>;
+type SavedGameSnapshot = {
+  game: Game;
+  gameMode: GameMode;
+  passSetup: PassSetup;
+  playerCount: number;
+  savedAt: number;
+};
+
+async function saveGame(snapshot: Omit<SavedGameSnapshot, 'savedAt'>) {
+  await AsyncStorage.setItem(SAVED_GAME_KEY, JSON.stringify({ ...snapshot, savedAt: Date.now() }));
+}
+
+async function loadSavedGame() {
+  const rawSave = await AsyncStorage.getItem(SAVED_GAME_KEY);
+  if (!rawSave) return null;
+
+  try {
+    const parsed = JSON.parse(rawSave) as SavedGameSnapshot;
+    if (!parsed?.game?.tokens || !parsed?.passSetup || !parsed?.gameMode) return null;
+    return parsed;
+  } catch {
+    await AsyncStorage.removeItem(SAVED_GAME_KEY);
+    return null;
+  }
+}
+
+async function clearSavedGame() {
+  await AsyncStorage.removeItem(SAVED_GAME_KEY);
+}
 
 type PassSetup = {
   players: number;
@@ -73,17 +108,49 @@ function useLoopAnimation(duration: number) {
 }
 
 export default function App() {
+  const diceAudioPlayer = useAudioPlayer(diceRollSound);
+  const tokenStepAudioPlayer = useAudioPlayer(tokenStepSound);
   const [screen, setScreen] = useState<Screen>('home');
   const [gameMode, setGameMode] = useState<GameMode>('pass');
   const [playerCount, setPlayerCount] = useState(4);
   const [game, setGame] = useState(() => createGame(4));
   const [notice, setNotice] = useState('Choose a mode to start.');
+  const [savedGamePrompt, setSavedGamePrompt] = useState<SavedGameSnapshot | null>(null);
+  const [storageReady, setStorageReady] = useState(false);
   const [passSetup, setPassSetup] = useState<PassSetup>({
     design: 'glass',
     players: 4,
     token: 'red',
     variant: 'classic',
   });
+
+  useEffect(() => {
+    setAudioModeAsync({
+      interruptionMode: 'mixWithOthers',
+      playsInSilentMode: true,
+    }).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    loadSavedGame()
+      .then((snapshot) => {
+        if (mounted && snapshot) setSavedGamePrompt(snapshot);
+      })
+      .finally(() => {
+        if (mounted) setStorageReady(true);
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!storageReady || screen !== 'game') return;
+    saveGame({ game, gameMode, passSetup, playerCount }).catch(() => undefined);
+  }, [game, gameMode, passSetup, playerCount, screen, storageReady]);
 
   function startGame(mode: GameMode, count = mode === 'computer' ? 2 : playerCount, setup = passSetup) {
     const firstPlayer = mode === 'pass' ? setup.token : 'red';
@@ -100,39 +167,81 @@ export default function App() {
     );
   }
 
+  function continueSavedGame(snapshot: SavedGameSnapshot) {
+    setGameMode(snapshot.gameMode);
+    setPlayerCount(snapshot.playerCount);
+    setPassSetup(snapshot.passSetup);
+    setGame(snapshot.game);
+    setScreen('game');
+    setSavedGamePrompt(null);
+    setNotice('Last match continued.');
+  }
+
+  function startFreshFromSavedPrompt() {
+    clearSavedGame().catch(() => undefined);
+    setSavedGamePrompt(null);
+    setScreen('home');
+    setGame(createGame(4));
+    setNotice('Old match cleared. Choose a mode to start.');
+  }
+
+  const playDiceRollSound = useCallback(() => {
+    diceAudioPlayer.seekTo(0).then(() => diceAudioPlayer.play()).catch(() => diceAudioPlayer.play());
+  }, [diceAudioPlayer]);
+
+  const playTokenStepSound = useCallback(() => {
+    tokenStepAudioPlayer.seekTo(0).then(() => tokenStepAudioPlayer.play()).catch(() => tokenStepAudioPlayer.play());
+  }, [tokenStepAudioPlayer]);
+
   if (screen === 'game') {
     return (
-      <GameScreen
-        game={game}
-        gameMode={gameMode}
-        passSetup={passSetup}
-        onBack={() => setScreen('home')}
-        onMove={(tokenId) => setGame((current) => moveToken(current, tokenId))}
-        onRoll={(forcedRoll) => {
-          setGame((current) => {
-            const rolled = rollDice(current, forcedRoll);
-            const autoMoveTokenId = getAutoMoveTokenId(rolled);
+      <>
+        <GameScreen
+          game={game}
+          gameMode={gameMode}
+          onDiceRollSound={playDiceRollSound}
+          passSetup={passSetup}
+          onBack={() => setScreen('home')}
+          onMove={(tokenId) => setGame((current) => moveToken(current, tokenId))}
+          onRoll={(forcedRoll) => {
+            setGame((current) => {
+              const rolled = rollDice(current, forcedRoll);
+              const autoMoveTokenId = getAutoMoveTokenId(rolled);
 
-            if (autoMoveTokenId) {
-              setTimeout(() => {
-                setGame((latest) => moveToken(latest, autoMoveTokenId));
-              }, 320);
-            }
+              if (autoMoveTokenId) {
+                setTimeout(() => {
+                  setGame((latest) => moveToken(latest, autoMoveTokenId));
+                }, AUTO_MOVE_PREVIEW_MS);
+              }
 
-            return rolled;
-          });
-        }}
-      />
+              return rolled;
+            });
+          }}
+          onTokenStepSound={playTokenStepSound}
+        />
+        <SavedGameModal
+          onContinue={() => savedGamePrompt && continueSavedGame(savedGamePrompt)}
+          onNewGame={startFreshFromSavedPrompt}
+          snapshot={savedGamePrompt}
+        />
+      </>
     );
   }
 
   return (
-    <HomeScreen
-      notice={notice}
-      onComputer={() => startGame('computer', 2)}
-      onComingSoon={(message) => setNotice(message)}
-      onPass={(setup) => startGame('pass', setup.variant === 'team' ? 4 : setup.players, setup)}
-    />
+    <>
+      <HomeScreen
+        notice={notice}
+        onComputer={() => startGame('computer', 2)}
+        onComingSoon={(message) => setNotice(message)}
+        onPass={(setup) => startGame('pass', setup.variant === 'team' ? 4 : setup.players, setup)}
+      />
+      <SavedGameModal
+        onContinue={() => savedGamePrompt && continueSavedGame(savedGamePrompt)}
+        onNewGame={startFreshFromSavedPrompt}
+        snapshot={savedGamePrompt}
+      />
+    </>
   );
 }
 
@@ -340,17 +449,21 @@ function HomeScreen({
 function GameScreen({
   game,
   gameMode,
+  onDiceRollSound,
   passSetup,
   onBack,
   onMove,
   onRoll,
+  onTokenStepSound,
 }: {
   game: Game;
   gameMode: GameMode;
+  onDiceRollSound: () => void;
   passSetup: PassSetup;
   onBack: () => void;
   onMove: (tokenId: string) => void;
   onRoll: (forcedRoll?: number) => void;
+  onTokenStepSound: () => void;
 }) {
   const { height, width } = useWindowDimensions();
   const [lastDiceByPlayer, setLastDiceByPlayer] = useState<DiceMemory>({});
@@ -362,7 +475,7 @@ function GameScreen({
   const isCpuTurn = gameMode === 'computer' && activePlayer.id !== 'red' && !game.winner;
   const legalTokenIds = useMemo(() => getLegalTokenIds(game), [game]);
   const cellMap = useMemo(() => buildCellMap(game.tokens), [game.tokens]);
-  const boardWidth = Math.max(260, Math.min(width - 20, height - 250, 540));
+  const boardWidth = Math.max(220, Math.min(width - 20, height - 300, 540));
   const cellSize = boardWidth / BOARD_SIZE;
   const activePulse = useLoopAnimation(520);
   const activeScale = activePulse.interpolate({
@@ -389,6 +502,7 @@ function GameScreen({
     const finalDice = Math.floor(Math.random() * 6) + 1;
     let ticks = 0;
 
+    onDiceRollSound();
     setRollingPlayerId(rollingFor);
     rollMotion.setValue(0);
     Animated.timing(rollMotion, {
@@ -427,11 +541,7 @@ function GameScreen({
   }, [game, isCpuTurn, onMove, rollWithAnimation]);
 
   return (
-    <ScrollView
-      contentInsetAdjustmentBehavior="automatic"
-      style={styles.gameRoot}
-      contentContainerStyle={[styles.gameContent, { minHeight: height }]}
-    >
+    <View style={styles.gameRoot}>
       <StatusBar style="light" />
       <GameBackdrop />
       <View style={styles.gameHeader}>
@@ -450,12 +560,13 @@ function GameScreen({
       </View>
 
       <View style={styles.gameBoardStage}>
-        <View style={[styles.diceRail, { width: boardWidth }]}>
+        <View style={[styles.diceRail, styles.topDiceRail, { width: boardWidth }]}>
           {(['red', 'green'] as PlayerId[]).map((playerId) => (
             <GameDicePad
               activeGlow={activeGlow}
               activePlayerId={activePlayer.id}
               arrowShift={arrowShift}
+              arrowPlacement="top"
               game={game}
               isCpuTurn={isCpuTurn}
               isRolling={isRolling}
@@ -477,15 +588,17 @@ function GameScreen({
             cellSize={cellSize}
             legalTokenIds={legalTokenIds}
             onMove={onMove}
+            onTokenStepSound={onTokenStepSound}
             playerIds={game.playerIds}
           />
         </View>
-        <View style={[styles.diceRail, { width: boardWidth }]}>
+        <View style={[styles.diceRail, styles.bottomDiceRail, { width: boardWidth }]}>
           {(['blue', 'yellow'] as PlayerId[]).map((playerId) => (
             <GameDicePad
               activeGlow={activeGlow}
               activePlayerId={activePlayer.id}
               arrowShift={arrowShift}
+              arrowPlacement="bottom"
               game={game}
               isCpuTurn={isCpuTurn}
               isRolling={isRolling}
@@ -500,7 +613,7 @@ function GameScreen({
           ))}
         </View>
       </View>
-    </ScrollView>
+    </View>
   );
 }
 
@@ -508,6 +621,7 @@ function GameDicePad({
   activeGlow,
   activePlayerId,
   arrowShift,
+  arrowPlacement,
   game,
   isCpuTurn,
   isRolling,
@@ -521,6 +635,7 @@ function GameDicePad({
   activeGlow: Animated.AnimatedInterpolation<string | number>;
   activePlayerId: PlayerId;
   arrowShift: Animated.AnimatedInterpolation<string | number>;
+  arrowPlacement: 'top' | 'bottom';
   game: Game;
   isCpuTurn: boolean;
   isRolling: boolean;
@@ -551,8 +666,15 @@ function GameDicePad({
       ]}
     >
       {isActive && (
-        <Animated.View pointerEvents="none" style={[styles.activeDiceArrow, { transform: [{ translateY: arrowShift }] }]}>
-          <Text style={styles.activeDiceArrowText}>↓</Text>
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.activeDiceArrow,
+            arrowPlacement === 'bottom' ? styles.bottomActiveDiceArrow : styles.topActiveDiceArrow,
+            { transform: [{ translateY: arrowShift }] },
+          ]}
+        >
+          <Text style={styles.activeDiceArrowText}>{arrowPlacement === 'bottom' ? '↑' : '↓'}</Text>
         </Animated.View>
       )}
       <Pressable disabled={!canRoll} onPress={onRoll} style={styles.playerDicePressable}>
@@ -601,6 +723,7 @@ function LudoBoard({
   cellSize,
   legalTokenIds,
   onMove,
+  onTokenStepSound,
   playerIds,
 }: {
   activePlayerId: PlayerId;
@@ -609,6 +732,7 @@ function LudoBoard({
   cellSize: number;
   legalTokenIds: Set<string>;
   onMove: (tokenId: string) => void;
+  onTokenStepSound: () => void;
   playerIds: PlayerId[];
 }) {
   const allTokens = Array.from(cellMap.entries()).flatMap(([key, tokens]) => {
@@ -660,6 +784,7 @@ function LudoBoard({
             isLegal={isLegal}
             key={token.id}
             onPress={() => onMove(token.id)}
+            onStepSound={onTokenStepSound}
             playerColor={player.color}
             playerName={player.name}
             cellSize={cellSize}
@@ -677,6 +802,7 @@ function BoardToken({
   isHome,
   isLegal,
   onPress,
+  onStepSound,
   playerColor,
   playerName,
   cellSize,
@@ -687,6 +813,7 @@ function BoardToken({
   isHome: boolean;
   isLegal: boolean;
   onPress: () => void;
+  onStepSound: () => void;
   playerColor: string;
   playerName: string;
   cellSize: number;
@@ -714,13 +841,13 @@ function BoardToken({
       Animated.sequence([
         Animated.parallel([
           Animated.timing(legalPulse, {
-            duration: 330,
+            duration: 220,
             easing: Easing.inOut(Easing.ease),
-            toValue: 1.18,
+            toValue: 1.3,
             useNativeDriver: true,
           }),
           Animated.timing(legalGlow, {
-            duration: 330,
+            duration: 220,
             easing: Easing.inOut(Easing.ease),
             toValue: 1,
             useNativeDriver: true,
@@ -728,13 +855,13 @@ function BoardToken({
         ]),
         Animated.parallel([
           Animated.timing(legalPulse, {
-            duration: 330,
+            duration: 220,
             easing: Easing.inOut(Easing.ease),
             toValue: 1,
             useNativeDriver: true,
           }),
           Animated.timing(legalGlow, {
-            duration: 330,
+            duration: 220,
             easing: Easing.inOut(Easing.ease),
             toValue: 0.25,
             useNativeDriver: true,
@@ -750,6 +877,11 @@ function BoardToken({
   useEffect(() => {
     const priorProgress = previousProgress.current;
     const didAdvance = token.progress > priorProgress && priorProgress >= -1;
+    const stepSoundTimers = didAdvance
+      ? Array.from({ length: token.progress - priorProgress }, (_, index) =>
+          setTimeout(onStepSound, index * TOKEN_STEP_MS),
+        )
+      : [];
     const stepAnimations = didAdvance
       ? Array.from({ length: token.progress - priorProgress }, (_, index) => priorProgress + index + 1).flatMap(
           (progress) => {
@@ -759,13 +891,13 @@ function BoardToken({
             return [
               Animated.parallel([
                 Animated.timing(translateX, {
-                  duration: 120,
+                  duration: TOKEN_STEP_MS,
                   easing: Easing.inOut(Easing.quad),
                   toValue: stepPosition.left,
                   useNativeDriver: true,
                 }),
                 Animated.timing(translateY, {
-                  duration: 120,
+                  duration: TOKEN_STEP_MS,
                   easing: Easing.inOut(Easing.quad),
                   toValue: stepPosition.top,
                   useNativeDriver: true,
@@ -778,17 +910,17 @@ function BoardToken({
 
     previousProgress.current = token.progress;
 
-    Animated.sequence([
+    const movementAnimation = Animated.sequence([
       ...stepAnimations,
       Animated.parallel([
         Animated.timing(translateX, {
-          duration: didAdvance ? 80 : 260,
+          duration: didAdvance ? 110 : 260,
           easing: Easing.out(Easing.cubic),
           toValue: position.left,
           useNativeDriver: true,
         }),
         Animated.timing(translateY, {
-          duration: didAdvance ? 80 : 260,
+          duration: didAdvance ? 110 : 260,
           easing: Easing.out(Easing.cubic),
           toValue: position.top,
           useNativeDriver: true,
@@ -808,8 +940,15 @@ function BoardToken({
           useNativeDriver: true,
         }),
       ]),
-    ]).start();
-  }, [cellSize, pop, position.left, position.top, token.id, token.index, token.playerId, token.progress, translateX, translateY]);
+    ]);
+
+    movementAnimation.start();
+
+    return () => {
+      stepSoundTimers.forEach(clearTimeout);
+      movementAnimation.stop();
+    };
+  }, [cellSize, onStepSound, pop, position.left, position.top, token.id, token.index, token.playerId, token.progress, translateX, translateY]);
 
   return (
     <AnimatedPressable
@@ -1323,6 +1462,68 @@ function PassSetupModal({
   );
 }
 
+function SavedGameModal({
+  onContinue,
+  onNewGame,
+  snapshot,
+}: {
+  onContinue: () => void;
+  onNewGame: () => void;
+  snapshot: SavedGameSnapshot | null;
+}) {
+  const pulse = useLoopAnimation(1800);
+  const scale = pulse.interpolate({
+    inputRange: [0, 0.5, 1],
+    outputRange: [1, 1.025, 1],
+  });
+
+  if (!snapshot) return null;
+
+  const activePlayer = findPlayer(snapshot.game.playerIds[snapshot.game.activePlayerIndex]);
+  const savedTime = new Date(snapshot.savedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const finishedTokens = snapshot.game.tokens.filter((token) => token.progress >= 56).length;
+
+  return (
+    <Modal animationType="fade" transparent visible onRequestClose={onContinue}>
+      <View style={styles.modalBackdrop}>
+        <View style={styles.modalBlurLayer} />
+        <Animated.View style={[styles.savedGameModal, { transform: [{ scale }] }]}>
+          <GlassSkin />
+          <Text selectable style={styles.savedGameTitle}>CONTINUE LAST GAME?</Text>
+          <Text selectable style={styles.savedGameSubtitle}>
+            Your match is saved. Current turn: {activePlayer.name}. Saved at {savedTime}.
+          </Text>
+          <View style={styles.savedGameStats}>
+            <View style={styles.savedGameStatBox}>
+              <GlassSkin />
+              <Text style={styles.savedGameStatValue}>{snapshot.playerCount}P</Text>
+              <Text selectable style={styles.savedGameStatLabel}>PLAYERS</Text>
+            </View>
+            <View style={styles.savedGameStatBox}>
+              <GlassSkin />
+              <Text style={styles.savedGameStatValue}>{snapshot.game.dice ?? '-'}</Text>
+              <Text selectable style={styles.savedGameStatLabel}>DICE</Text>
+            </View>
+            <View style={styles.savedGameStatBox}>
+              <GlassSkin />
+              <Text style={styles.savedGameStatValue}>{finishedTokens}</Text>
+              <Text selectable style={styles.savedGameStatLabel}>HOME</Text>
+            </View>
+          </View>
+          <Pressable onPress={onContinue} style={styles.savedContinueButton}>
+            <GlassSkin />
+            <Text style={styles.savedContinueText}>CONTINUE</Text>
+          </Pressable>
+          <Pressable onPress={onNewGame} style={styles.savedNewButton}>
+            <GlassSkin />
+            <Text style={styles.savedNewText}>NEW GAME</Text>
+          </Pressable>
+        </Animated.View>
+      </View>
+    </Modal>
+  );
+}
+
 function TokenDesignPreview({ color, design }: { color: string; design: TokenDesign }) {
   return (
     <View
@@ -1654,22 +1855,27 @@ const styles: Record<string, ViewStyle | TextStyle> = {
   },
   activeDiceArrow: {
     alignItems: 'center',
-    height: 24,
+    height: 48,
     justifyContent: 'center',
     left: 0,
     position: 'absolute',
     right: 0,
-    top: -25,
     zIndex: 4,
+  },
+  topActiveDiceArrow: {
+    top: -52,
+  },
+  bottomActiveDiceArrow: {
+    bottom: -52,
   },
   activeDiceArrowText: {
     color: '#FFD84A',
-    fontSize: 26,
+    fontSize: 48,
     fontWeight: '900',
-    lineHeight: 28,
+    lineHeight: 50,
     textShadowColor: '#5A3500',
-    textShadowOffset: { height: 2, width: 0 },
-    textShadowRadius: 1,
+    textShadowOffset: { height: 3, width: 0 },
+    textShadowRadius: 2,
   },
   boardCourtOverlay: {
     bottom: 0,
@@ -1957,6 +2163,13 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     justifyContent: 'space-between',
     overflow: 'visible',
   },
+  topDiceRail: {
+    marginTop: 42,
+  },
+  bottomDiceRail: {
+    marginBottom: 42,
+    marginTop: 8,
+  },
   diceFaceGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -2073,7 +2286,7 @@ const styles: Record<string, ViewStyle | TextStyle> = {
     left: 10,
     position: 'absolute',
     right: 10,
-    top: 10,
+    top: 46,
     zIndex: 20,
   },
   gameRoot: {
@@ -2971,6 +3184,109 @@ const styles: Record<string, ViewStyle | TextStyle> = {
   selectedGoldCard: {
     backgroundColor: 'rgba(71, 51, 8, 0.88)',
     boxShadow: '0 2px 0 rgba(255,255,255,0.28) inset, 0 -5px 0 rgba(0,0,0,0.28) inset, 0 0 16px rgba(224, 169, 21, 0.65)',
+  },
+  savedContinueButton: {
+    alignItems: 'center',
+    alignSelf: 'center',
+    backgroundColor: '#E0A915',
+    borderColor: '#FFF5BD',
+    borderRadius: 15,
+    borderWidth: 2,
+    boxShadow: yellowGlassShadow,
+    justifyContent: 'center',
+    minHeight: 50,
+    overflow: 'hidden',
+    width: '82%',
+  },
+  savedContinueText: {
+    color: '#221700',
+    fontSize: 16,
+    fontWeight: '900',
+    letterSpacing: 1.1,
+    textShadowColor: 'rgba(255,255,255,0.35)',
+    textShadowOffset: { height: 1, width: 0 },
+    textShadowRadius: 0,
+  },
+  savedGameModal: {
+    backgroundColor: 'rgba(10, 13, 30, 0.96)',
+    borderColor: '#E0A915',
+    borderRadius: 22,
+    borderWidth: 3,
+    boxShadow: '0 3px 0 rgba(255,255,255,0.2) inset, 0 -10px 0 rgba(0,0,0,0.3) inset, 0 12px 28px rgba(0,0,0,0.48)',
+    gap: 13,
+    maxWidth: 390,
+    overflow: 'hidden',
+    padding: 17,
+    width: '100%',
+  },
+  savedGameStatBox: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(12, 79, 172, 0.86)',
+    borderColor: 'rgba(255, 232, 113, 0.7)',
+    borderRadius: 12,
+    borderWidth: 2,
+    boxShadow: blueGlassShadow,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 64,
+    overflow: 'hidden',
+  },
+  savedGameStatLabel: {
+    color: '#A8D9FF',
+    fontSize: 9,
+    fontWeight: '900',
+    letterSpacing: 0.8,
+  },
+  savedGameStats: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  savedGameStatValue: {
+    color: '#FFE456',
+    fontSize: 19,
+    fontWeight: '900',
+    textShadowColor: '#402600',
+    textShadowOffset: { height: 2, width: 0 },
+    textShadowRadius: 0,
+  },
+  savedGameSubtitle: {
+    color: '#B8DDFF',
+    fontSize: 13,
+    fontWeight: '800',
+    lineHeight: 18,
+    textAlign: 'center',
+  },
+  savedGameTitle: {
+    color: '#FFE456',
+    fontSize: 22,
+    fontWeight: '900',
+    letterSpacing: 1,
+    textAlign: 'center',
+    textShadowColor: '#633B00',
+    textShadowOffset: { height: 2, width: 0 },
+    textShadowRadius: 0,
+  },
+  savedNewButton: {
+    alignItems: 'center',
+    alignSelf: 'center',
+    backgroundColor: 'rgba(15, 85, 184, 0.92)',
+    borderColor: '#E0A915',
+    borderRadius: 14,
+    borderWidth: 2,
+    boxShadow: blueGlassShadow,
+    justifyContent: 'center',
+    minHeight: 46,
+    overflow: 'hidden',
+    width: '72%',
+  },
+  savedNewText: {
+    color: '#FFE456',
+    fontSize: 14,
+    fontWeight: '900',
+    letterSpacing: 1,
+    textShadowColor: '#001D55',
+    textShadowOffset: { height: 2, width: 0 },
+    textShadowRadius: 0,
   },
   shineBeam: {
     backgroundColor: 'rgba(255, 255, 255, 0.22)',
