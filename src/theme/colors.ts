@@ -1,0 +1,31 @@
+export const colors = {
+  royalBlue: '#1565FF',
+  royalBlueLight: '#4D8FFF',
+  royalBlueDark: '#0D4BB8',
+  gold: '#FFD54A',
+  goldLight: '#FFE082',
+  goldDark: '#E6B800',
+  navy: '#0B1220',
+  navyMid: '#121C32',
+  navyLight: '#1A2848',
+  white: '#FFFFFF',
+  whiteMuted: 'rgba(255,255,255,0.72)',
+  glass: 'rgba(255,255,255,0.12)',
+  glassBorder: 'rgba(255,255,255,0.28)',
+  glassStrong: 'rgba(21, 101, 255, 0.22)',
+  textPrimary: '#FFFFFF',
+  textGold: '#FFD54A',
+  textMuted: '#9BB4E8',
+  danger: '#FF4757',
+  success: '#2ED573',
+  overlay: 'rgba(11, 18, 32, 0.82)',
+  neonBlue: 'rgba(21, 101, 255, 0.55)',
+  neonGold: 'rgba(255, 213, 74, 0.5)',
+} as const;
+
+export const playerGem = {
+  red: { base: '#E53935', glow: '#FF5252', rim: '#FF8A80', label: 'Ruby' },
+  green: { base: '#00C853', glow: '#69F0AE', rim: '#B9F6CA', label: 'Emerald' },
+  yellow: { base: '#FFD54A', glow: '#FFE57F', rim: '#FFF9C4', label: 'Gold' },
+  blue: { base: '#1565FF', glow: '#448AFF', rim: '#82B1FF', label: 'Sapphire' },
+} as const;

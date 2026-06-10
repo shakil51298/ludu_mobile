@@ -1,5 +1,4 @@
 import { StatusBar } from 'expo-status-bar';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 import LottieView from 'lottie-react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -11,6 +10,8 @@ import {
   ImageBackground,
   Modal,
   Pressable,
+  ScrollView,
+  StyleSheet,
   Text,
   useWindowDimensions,
   View,
@@ -37,6 +38,24 @@ import {
   type PlayerId,
   type Token,
 } from './src/ludoEngine';
+import { LudoBoardGrid } from './src/components/board/LudoBoardGrid';
+import { GameMessageBanner } from './src/components/game/GameMessageBanner';
+import { getWinnerDisplayName } from './src/gameMessages';
+import { CPU_TURN_DELAY_MS } from './src/constants/game';
+import { clearSavedGame, loadSavedGame, saveGame } from './src/storage/gameStorage';
+import { HomeScreen } from './src/screens/HomeScreen';
+import { PremiumWinnerModal } from './src/components/modals/PremiumWinnerModal';
+import { SettingsModal } from './src/components/modals/SettingsModal';
+import { PremiumToken } from './src/components/game/PremiumToken';
+import { PremiumDiceFace } from './src/components/game/PremiumDice';
+import { PlayerStatusCard } from './src/components/game/PlayerStatusCard';
+import { BoardAmbientGlow } from './src/components/game/BoardAmbientGlow';
+import { GradientBackground } from './src/components/ui/GradientBackground';
+import { PremiumButton } from './src/components/ui/PremiumButton';
+import { useHaptics } from './src/hooks/useHaptics';
+import { colors, gradients } from './src/theme';
+import { LinearGradient } from 'expo-linear-gradient';
+import { BlurView } from 'expo-blur';
 
 const boardImage = require('./assets/boards/ludo-diagram-board.png');
 const homeBackgroundImage = require('./assets/backgrounds/ludo-perspective-home.png');
@@ -54,12 +73,11 @@ const DICE_ROLL_MS = 1390;
 const DICE_TICK_MS = 72;
 const TOKEN_STEP_MS = 220;
 const KILLED_RETURN_STEP_MS = 82;
-const SAVED_GAME_KEY = 'king-ludo.saved-game.v1';
 const HOME_TABS = ['HOME', 'EVENT', 'ADDA', 'INVENTORY', 'SOCIAL'] as const;
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
 
 type Screen = 'home' | 'game';
-type GameMode = 'pass' | 'computer';
+type GameMode = 'pass' | 'computer' | 'team';
 type HomeTab = (typeof HOME_TABS)[number];
 type PassVariant = 'classic' | 'team';
 type TokenDesign = 'glass' | 'royal' | 'neon';
@@ -78,28 +96,6 @@ type SavedGameSnapshot = {
   playerCount: number;
   savedAt: number;
 };
-
-async function saveGame(snapshot: Omit<SavedGameSnapshot, 'savedAt'>) {
-  await AsyncStorage.setItem(SAVED_GAME_KEY, JSON.stringify({ ...snapshot, savedAt: Date.now() }));
-}
-
-async function loadSavedGame() {
-  const rawSave = await AsyncStorage.getItem(SAVED_GAME_KEY);
-  if (!rawSave) return null;
-
-  try {
-    const parsed = JSON.parse(rawSave) as SavedGameSnapshot;
-    if (!parsed?.game?.tokens || !parsed?.passSetup || !parsed?.gameMode) return null;
-    return parsed;
-  } catch {
-    await AsyncStorage.removeItem(SAVED_GAME_KEY);
-    return null;
-  }
-}
-
-async function clearSavedGame() {
-  await AsyncStorage.removeItem(SAVED_GAME_KEY);
-}
 
 type PassSetup = {
   players: number;
@@ -158,6 +154,20 @@ function AppContent() {
     token: 'red',
     variant: 'classic',
   });
+  const [messageFlags, setMessageFlags] = useState({ lastCapture: false, lastExtraTurn: false });
+  const [showPassSetup, setShowPassSetup] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showPause, setShowPause] = useState(false);
+  const [soundOn, setSoundOn] = useState(true);
+  const [musicOn, setMusicOn] = useState(true);
+  const [vibrationOn, setVibrationOn] = useState(true);
+  const haptics = useHaptics();
+  const [passSetupDraft, setPassSetupDraft] = useState<PassSetup>({
+    design: 'glass',
+    players: 4,
+    token: 'red',
+    variant: 'classic',
+  });
 
   useEffect(() => {
     setAudioModeAsync({
@@ -188,19 +198,24 @@ function AppContent() {
   }, [game, gameMode, passSetup, playerCount, screen, storageReady]);
 
   function startGame(mode: GameMode, count = mode === 'computer' ? 2 : playerCount, setup = passSetup) {
-    const firstPlayer = mode === 'pass' ? setup.token : 'red';
+    const teamMode = mode === 'team' || setup.variant === 'team';
+    const playerTotal = teamMode ? 4 : count;
+    const firstPlayer = mode === 'pass' || mode === 'team' ? setup.token : 'red';
 
-    setGameMode(mode);
-    setPlayerCount(count);
-    setPassSetup(setup);
-    setGame(createGame(count, firstPlayer));
+    setGameMode(mode === 'team' ? 'team' : mode);
+    setPlayerCount(playerTotal);
+    setPassSetup(teamMode ? { ...setup, variant: 'team', players: 4 } : setup);
+    setGame(createGame(playerTotal, firstPlayer, { teamMode }));
     setCaptureEvent(null);
     setWinnerCelebration(null);
+    setMessageFlags({ lastCapture: false, lastExtraTurn: false });
     setScreen('game');
     setNotice(
       mode === 'computer'
         ? 'Computer match started.'
-        : `${setup.variant === 'team' ? 'Team Up' : 'Classic'} Pass N Play started.`,
+        : teamMode
+          ? 'Team Up: Red+Yellow vs Green+Blue.'
+          : `${setup.variant === 'team' ? 'Team Up' : 'Classic'} Pass N Play started.`,
     );
   }
 
@@ -231,12 +246,13 @@ function AppContent() {
   }, []);
 
   const playDiceRollSound = useCallback(() => {
-    playSound(diceAudioPlayer);
-  }, [diceAudioPlayer, playSound]);
+    if (vibrationOn) haptics.diceRoll();
+    if (soundOn) playSound(diceAudioPlayer);
+  }, [diceAudioPlayer, haptics, playSound, soundOn, vibrationOn]);
 
   const playTokenStepSound = useCallback(() => {
-    playSound(tokenStepAudioPlayer);
-  }, [playSound, tokenStepAudioPlayer]);
+    if (soundOn) playSound(tokenStepAudioPlayer);
+  }, [playSound, soundOn, tokenStepAudioPlayer]);
 
   const playMoveResultSounds = useCallback((before: Game, after: Game, tokenId: string) => {
     if (before === after) return;
@@ -260,14 +276,29 @@ function AppContent() {
         SAFE_GLOBAL_INDEXES.has(getGlobalIndex(movingAfter)),
     );
 
-    if (captured) playSound(captureAudioPlayer);
-    if (landedOnSafeStar) setTimeout(() => playSound(safeStarAudioPlayer), captured ? 220 : 0);
-    if (reachedFinalHome) setTimeout(() => playSound(finalHomeAudioPlayer), captured ? 360 : 0);
+    if (captured) {
+      if (vibrationOn) haptics.capture();
+      if (soundOn) playSound(captureAudioPlayer);
+    }
+    if (landedOnSafeStar && soundOn) setTimeout(() => playSound(safeStarAudioPlayer), captured ? 220 : 0);
+    if (reachedFinalHome && soundOn) setTimeout(() => playSound(finalHomeAudioPlayer), captured ? 360 : 0);
     if (after.winner && after.winner !== before.winner) {
       setWinnerCelebration(after.winner);
-      setTimeout(() => playSound(victoryAudioPlayer), reachedFinalHome || captured ? 700 : 0);
+      if (vibrationOn) haptics.winner();
+      if (soundOn) {
+        setTimeout(() => playSound(victoryAudioPlayer), reachedFinalHome || captured ? 700 : 0);
+      }
     }
-  }, [captureAudioPlayer, finalHomeAudioPlayer, playSound, safeStarAudioPlayer, victoryAudioPlayer]);
+  }, [
+    captureAudioPlayer,
+    finalHomeAudioPlayer,
+    haptics,
+    playSound,
+    safeStarAudioPlayer,
+    soundOn,
+    victoryAudioPlayer,
+    vibrationOn,
+  ]);
 
   const applyMove = useCallback((tokenId: string) => {
     setGame((current) => {
@@ -298,6 +329,10 @@ function AppContent() {
         });
       }
 
+      if (capturedTokenIds.length) {
+        setMessageFlags({ lastCapture: true, lastExtraTurn: true });
+      }
+
       playMoveResultSounds(current, next, tokenId);
       return next;
     });
@@ -310,6 +345,7 @@ function AppContent() {
           game={game}
           gameMode={gameMode}
           captureEvent={captureEvent}
+          messageFlags={messageFlags}
           onDiceRollSound={playDiceRollSound}
           passSetup={passSetup}
           onBack={() => setScreen('home')}
@@ -318,6 +354,10 @@ function AppContent() {
             setGame((current) => {
               const rolled = rollDice(current, forcedRoll);
               const autoMoveTokenId = getAutoMoveTokenId(rolled);
+
+              if (rolled.dice === 6 && rolled.phase === 'move') {
+                setMessageFlags((flags) => ({ ...flags, lastExtraTurn: true }));
+              }
 
               if (autoMoveTokenId) {
                 setTimeout(() => {
@@ -329,17 +369,40 @@ function AppContent() {
             });
           }}
           onTokenStepSound={playTokenStepSound}
+          onOpenPause={() => setShowPause(true)}
+          onOpenSettings={() => setShowSettings(true)}
         />
         <SavedGameModal
           onContinue={() => savedGamePrompt && continueSavedGame(savedGamePrompt)}
           onNewGame={startFreshFromSavedPrompt}
           snapshot={savedGamePrompt}
         />
-        <WinningModal
+        <PremiumWinnerModal
+          game={game}
           onClose={() => setWinnerCelebration(null)}
           onNewGame={() => startGame(gameMode, playerCount, passSetup)}
           winnerId={winnerCelebration}
         />
+        <SettingsModal
+          musicOn={musicOn}
+          onClose={() => setShowSettings(false)}
+          onMusicToggle={setMusicOn}
+          onSoundToggle={setSoundOn}
+          onVibrationToggle={setVibrationOn}
+          soundOn={soundOn}
+          vibrationOn={vibrationOn}
+          visible={showSettings}
+        />
+        {showPause && (
+          <PauseOverlay
+            onClose={() => setShowPause(false)}
+            onHome={() => {
+              setShowPause(false);
+              setScreen('home');
+            }}
+            onResume={() => setShowPause(false)}
+          />
+        )}
       </>
     );
   }
@@ -347,231 +410,109 @@ function AppContent() {
   return (
     <>
       <HomeScreen
+        hasSavedGame={Boolean(savedGamePrompt)}
         notice={notice}
         onComputer={() => startGame('computer', 2)}
-        onComingSoon={(message) => setNotice(message)}
-        onPass={(setup) => startGame('pass', setup.variant === 'team' ? 4 : setup.players, setup)}
+        onContinue={() => savedGamePrompt && continueSavedGame(savedGamePrompt)}
+        onPassSetupOpen={() => setShowPassSetup(true)}
+        onSettings={() => setShowSettings(true)}
+        onTeamUp={() =>
+          startGame('team', 4, { design: 'glass', players: 4, token: 'red', variant: 'team' })
+        }
+      />
+      <PassSetupModal
+        onClose={() => setShowPassSetup(false)}
+        onNext={() => {
+          setShowPassSetup(false);
+          startGame(
+            passSetupDraft.variant === 'team' ? 'team' : 'pass',
+            passSetupDraft.variant === 'team' ? 4 : passSetupDraft.players,
+            passSetupDraft,
+          );
+        }}
+        setup={passSetupDraft}
+        setSetup={setPassSetupDraft}
+        visible={showPassSetup}
       />
       <SavedGameModal
         onContinue={() => savedGamePrompt && continueSavedGame(savedGamePrompt)}
         onNewGame={startFreshFromSavedPrompt}
         snapshot={savedGamePrompt}
       />
+      <SettingsModal
+        musicOn={musicOn}
+        onClose={() => setShowSettings(false)}
+        onMusicToggle={setMusicOn}
+        onSoundToggle={setSoundOn}
+        onVibrationToggle={setVibrationOn}
+        soundOn={soundOn}
+        vibrationOn={vibrationOn}
+        visible={showSettings}
+      />
     </>
   );
 }
 
-function HomeScreen({
-  notice,
-  onComingSoon,
-  onComputer,
-  onPass,
+function PauseOverlay({
+  onClose,
+  onHome,
+  onResume,
 }: {
-  notice: string;
-  onComingSoon: (message: string) => void;
-  onComputer: () => void;
-  onPass: (setup: PassSetup) => void;
+  onClose: () => void;
+  onHome: () => void;
+  onResume: () => void;
 }) {
-  const insets = useSafeAreaInsets();
-  const [activeTab, setActiveTab] = useState<HomeTab>('HOME');
-  const [showNotifications, setShowNotifications] = useState(false);
-  const [showPassSetup, setShowPassSetup] = useState(false);
-  const [unreadNotifications, setUnreadNotifications] = useState(3);
-  const [setup, setSetup] = useState<PassSetup>({
-    design: 'glass',
-    players: 4,
-    token: 'red',
-    variant: 'classic',
-  });
-  const shimmer = useLoopAnimation(2600);
-  const bounce = useLoopAnimation(1700);
-  const logoScale = shimmer.interpolate({
-    inputRange: [0, 0.5, 1],
-    outputRange: [1, 1.05, 1],
-  });
-  const floatY = bounce.interpolate({
-    inputRange: [0, 0.5, 1],
-    outputRange: [0, -10, 0],
-  });
-  const shineX = shimmer.interpolate({
-    inputRange: [0, 1],
-    outputRange: [-220, 220],
-  });
-  const topInset = Math.max(insets.top, 22);
-  const bottomInset = Math.max(insets.bottom, 18);
-  const topBarHeight = topInset + 54;
-  const bottomTabsHeight = bottomInset + 58;
-
   return (
-    <View style={styles.homeRoot}>
-      <StatusBar style="light" />
-      <HomeArtBackground />
-      <View pointerEvents="none" style={[styles.sparkleCurtain, { bottom: bottomTabsHeight, top: topBarHeight }]}>
-        <Animated.View style={[styles.shineBeam, { transform: [{ translateX: shineX }, { rotate: '-14deg' }] }]} />
-        <LottieView autoPlay loop source={coinSparkle} style={styles.coinBurstLeft} />
-        <LottieView autoPlay loop source={coinSparkle} style={styles.coinBurstRight} />
+    <View style={pauseStyles.overlay}>
+      <BlurView intensity={50} tint="dark" style={StyleSheet.absoluteFill} />
+      <View style={pauseStyles.panel}>
+        <Text style={pauseStyles.title}>PAUSED</Text>
+        <PremiumButton label="RESUME" onPress={onResume} style={pauseStyles.btn} />
+        <PremiumButton label="HOME" onPress={onHome} style={pauseStyles.btn} variant="secondary" />
+        <PremiumButton label="CLOSE" onPress={onClose} style={pauseStyles.btn} variant="secondary" />
       </View>
-      <View style={[styles.topBar, { minHeight: topBarHeight, paddingTop: topInset + 3 }]}>
-        <View style={styles.avatarFrame}>
-          <View style={styles.avatarFace}>
-            <Text style={styles.avatarText}>P</Text>
-          </View>
-          <View style={styles.onlineDot} />
-        </View>
-        <TopIcon label="SET" onPress={() => onComingSoon('Settings panel is ready for sound, vibration, and table rules.')} />
-        <TopIcon
-          label="MAIL"
-          badge={unreadNotifications > 0 ? String(unreadNotifications) : undefined}
-          onPress={() => {
-            setShowNotifications((current) => !current);
-            setUnreadNotifications(0);
-          }}
-        />
-        <Currency amount="50" tone="gem" />
-        <Currency amount="2,550" tone="coin" />
-        <TopIcon label="SHOP" onPress={() => onComingSoon('Shop preview: coins, dice skins, frames, and table themes.')} />
-      </View>
-
-      <View style={[styles.sideRail, { top: topBarHeight + 16 }]}>
-        <SmallBadge title="STARTER" subtitle="PACK" />
-        <RoundBadge title="K" />
-        <SmallBadge title="FREE" subtitle="COINS" />
-      </View>
-
-      <View style={[styles.homeContent, { paddingBottom: bottomTabsHeight + 8, paddingTop: topBarHeight + 18 }]}>
-        <View style={styles.helpBubble}>
-          <GlassSkin />
-          <Text style={styles.helpText}>?</Text>
-        </View>
-        <Animated.View style={[styles.heroLogo, { transform: [{ scale: logoScale }, { translateY: floatY }] }]}>
-          <LottieView autoPlay loop source={crownPulse} style={styles.crownLottie} />
-          <Text style={styles.kingText}>KING</Text>
-          <View style={styles.logoLetters}>
-            {'LUDO'.split('').map((letter, index) => (
-              <Animated.View
-                key={letter}
-                style={[
-                  styles.logoBall,
-                  {
-                    backgroundColor: ['#2D8FE8', '#E94751', '#25A866', '#F2C230'][index],
-                    transform: [
-                      {
-                        translateY: shimmer.interpolate({
-                          inputRange: [0, 0.25, 0.5, 0.75, 1],
-                          outputRange: [0, index % 2 ? -5 : 3, 0, index % 2 ? 3 : -5, 0],
-                        }),
-                      },
-                    ],
-                  },
-                ]}
-              >
-                <Text style={styles.logoLetter}>{letter}</Text>
-              </Animated.View>
-            ))}
-          </View>
-          <MiniBoard />
-        </Animated.View>
-
-        <Text selectable style={styles.noticeText}>
-          {notice}
-        </Text>
-
-        <View style={styles.playOptions}>
-          <PlayOptionButton
-            accent="#28E365"
-            detail="You vs computer"
-            icon="🤖"
-            onPress={onComputer}
-            title="PLAY COMPUTER"
-          />
-          <PlayOptionButton
-            accent="#FFD22D"
-            detail="2-4 local players"
-            icon="🎲"
-            onPress={() => setShowPassSetup(true)}
-            title="PASS N PLAY"
-          />
-        </View>
-
-        <View style={styles.modeGrid}>
-          <ModeCard
-            icon="GLOBE"
-            players="Players: 145,509"
-            title="ONLINE"
-            onPress={() => onComingSoon('Online matchmaking needs a backend. Local modes are ready.')}
-          />
-          <ModeCard
-            icon="TEAM"
-            players="Players: 3,944"
-            title="TEAM UP"
-            onPress={() => onComingSoon('Team Up is prepared for future multiplayer rooms.')}
-          />
-          <ModeCard
-            icon="LOVE"
-            players="Players: 14,749"
-            title="FRIENDS"
-            onPress={() => onComingSoon('Friends mode will need accounts and invites.')}
-          />
-        </View>
-
-        <AnimatedBabyField />
-
-        {showNotifications && <NotificationPanel />}
-
-        <HomeTabPanel activeTab={activeTab} />
-
-        <View style={styles.tournamentRow}>
-          <GiftButton label="7" />
-          <View style={styles.tournamentBadge}>
-            <Text style={styles.tournamentCrown}>♕</Text>
-            <Text style={styles.tournamentText}>TOURNAMENT</Text>
-          </View>
-          <GiftButton label="DICE" />
-        </View>
-
-        <View style={styles.seasonTicket}>
-          <GlassSkin />
-          <Text style={styles.seasonText}>SEASON 26</Text>
-          <Text style={styles.comingText}>Coming soon!</Text>
-        </View>
-      </View>
-
-      <View style={[styles.bottomTabs, { minHeight: bottomTabsHeight, paddingBottom: bottomInset }]}>
-        {HOME_TABS.map((tab, index) => (
-          <Pressable
-            key={tab}
-            onPress={() => {
-              setActiveTab(tab);
-              onComingSoon(`${tab} tab selected.`);
-              setShowNotifications(false);
-            }}
-            style={[styles.bottomTab, activeTab === tab && styles.activeBottomTab]}
-          >
-            <GlassSkin />
-            <Text style={styles.bottomIcon}>{['⌂', '★', 'MIC', 'DICE', 'CHAT'][index]}</Text>
-            <Text style={styles.bottomText}>{tab}</Text>
-          </Pressable>
-        ))}
-      </View>
-      <PassSetupModal
-        onClose={() => setShowPassSetup(false)}
-        onNext={() => {
-          setShowPassSetup(false);
-          onPass(setup);
-        }}
-        setup={setup}
-        setSetup={setSetup}
-        visible={showPassSetup}
-      />
     </View>
   );
 }
+
+const pauseStyles = {
+  overlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center' as const,
+    backgroundColor: colors.overlay,
+    justifyContent: 'center' as const,
+    zIndex: 100,
+  },
+  panel: {
+    alignItems: 'center' as const,
+    backgroundColor: colors.navyMid,
+    borderColor: colors.gold,
+    borderRadius: 20,
+    borderWidth: 2,
+    padding: 24,
+    width: '82%' as const,
+  },
+  title: {
+    color: colors.gold,
+    fontSize: 28,
+    fontWeight: '900' as const,
+    marginBottom: 20,
+  },
+  btn: {
+    marginTop: 10,
+    width: '100%' as const,
+  },
+};
+
 
 function GameScreen({
   captureEvent,
   game,
   gameMode,
+  messageFlags,
   onDiceRollSound,
+  onOpenPause,
+  onOpenSettings,
   passSetup,
   onBack,
   onMove,
@@ -581,7 +522,10 @@ function GameScreen({
   captureEvent: CaptureEvent | null;
   game: Game;
   gameMode: GameMode;
+  messageFlags: { lastCapture: boolean; lastExtraTurn: boolean };
   onDiceRollSound: () => void;
+  onOpenPause: () => void;
+  onOpenSettings: () => void;
   passSetup: PassSetup;
   onBack: () => void;
   onMove: (tokenId: string) => void;
@@ -593,9 +537,12 @@ function GameScreen({
   const [rollingPlayerId, setRollingPlayerId] = useState<PlayerId | null>(null);
   const [rollingValue, setRollingValue] = useState(1);
   const rollMotion = useRef(new Animated.Value(0)).current;
-  const activePlayer = findPlayer(game.playerIds[game.activePlayerIndex]);
+  const activePlayer = findPlayer(game.playerIds[game.activePlayerIndex]) ?? PLAYERS[0];
   const isRolling = Boolean(rollingPlayerId);
-  const isCpuTurn = gameMode === 'computer' && activePlayer.id !== 'red' && !game.winner;
+  const isCpuTurn =
+    gameMode === 'computer' &&
+    activePlayer.id !== 'red' &&
+    !game.winner;
   const legalTokenIds = useMemo(() => getLegalTokenIds(game), [game]);
   const cellMap = useMemo(() => buildCellMap(game.tokens), [game.tokens]);
   const boardWidth = Math.max(220, Math.min(width - 20, height - 300, 540));
@@ -658,31 +605,68 @@ function GameScreen({
         const tokenId = chooseCpuToken(game);
         if (tokenId) onMove(tokenId);
       }
-    }, 520);
+    }, CPU_TURN_DELAY_MS);
 
     return () => clearTimeout(timer);
   }, [game, isCpuTurn, onMove, rollWithAnimation]);
 
+  const leadingId = useMemo(() => {
+    const scores = game.playerIds.map((id) => ({
+      id,
+      finished: game.tokens.filter((t) => t.playerId === id && t.progress === FINISH_PROGRESS).length,
+    }));
+    return scores.sort((a, b) => b.finished - a.finished)[0]?.id;
+  }, [game]);
+
   return (
-    <View style={styles.gameRoot}>
+    <GradientBackground colors={gradients.boardAmbient} style={styles.gameRoot}>
       <StatusBar style="light" />
       <GameBackdrop />
       <View style={styles.gameHeader}>
         <Pressable onPress={onBack} style={styles.backButton}>
-          <GlassSkin />
+          <LinearGradient colors={[...gradients.primaryButton]} style={StyleSheet.absoluteFill} />
           <Text style={styles.backText}>BACK</Text>
         </Pressable>
+        <Pressable onPress={onOpenPause} style={styles.iconBtn}>
+          <Text style={styles.iconBtnText}>⏸</Text>
+        </Pressable>
+        <Pressable onPress={onOpenSettings} style={styles.iconBtn}>
+          <Text style={styles.iconBtnText}>⚙</Text>
+        </Pressable>
         <View style={{ flex: 1 }}>
-          <Text style={styles.gameTitle}>Ludo Play</Text>
+          <Text style={styles.gameTitle}>LUDO KING</Text>
           <Text style={styles.gameSubtitle}>
             {gameMode === 'computer'
               ? 'Computer Match'
-              : `${passSetup.variant === 'team' ? 'Team Up' : 'Classic'} • ${passSetup.design} tokens`}
+              : game.teamMode || passSetup.variant === 'team'
+                ? 'Team Up • Red+Yellow vs Green+Blue'
+                : `Classic • ${passSetup.design} tokens`}
           </Text>
         </View>
       </View>
 
+      <GameMessageBanner
+        context={messageFlags}
+        game={game}
+        style={styles.gameMessageBanner}
+        textStyle={styles.gameMessageText}
+      />
+
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.playerStrip}>
+        {game.playerIds.map((playerId) => (
+          <PlayerStatusCard
+            key={playerId}
+            diceValue={activePlayer.id === playerId ? game.dice ?? lastDiceByPlayer[playerId] : lastDiceByPlayer[playerId]}
+            finishedCount={game.tokens.filter((t) => t.playerId === playerId && t.progress === FINISH_PROGRESS).length}
+            isActive={activePlayer.id === playerId}
+            isLeading={leadingId === playerId}
+            playerId={playerId}
+          />
+        ))}
+      </ScrollView>
+
       <View style={styles.gameBoardStage}>
+        <BoardAmbientGlow size={boardWidth} />
         <View style={[styles.diceRail, styles.topDiceRail, { width: boardWidth }]}>
           {(['red', 'green'] as PlayerId[]).map((playerId) => (
             <GameDicePad
@@ -737,7 +721,7 @@ function GameScreen({
           ))}
         </View>
       </View>
-    </View>
+    </GradientBackground>
   );
 }
 
@@ -770,7 +754,7 @@ function GameDicePad({
   rollingRotate: Animated.AnimatedInterpolation<string | number>;
   rollingValue: number;
 }) {
-  const player = findPlayer(playerId);
+  const player = findPlayer(playerId) ?? PLAYERS[0];
   const isInGame = game.playerIds.includes(playerId);
   const isActive = activePlayerId === playerId && isInGame && !game.winner;
   const isThisDiceRolling = rollingPlayerId === playerId;
@@ -801,19 +785,16 @@ function GameDicePad({
           <Text style={styles.activeDiceArrowText}>{arrowPlacement === 'bottom' ? '↑' : '↓'}</Text>
         </Animated.View>
       )}
-      <Pressable disabled={!canRoll} onPress={onRoll} style={styles.playerDicePressable}>
-        <GlassSkin />
-        <Animated.View
-          style={[
-            styles.playerDiceIcon,
-            isThisDiceRolling ? { transform: [{ rotate: rollingRotate }, { scale: 1.12 }] } : null,
-            !displayValue ? { opacity: 0.5 } : null,
-          ]}
-        >
-          <DiceFace value={displayValue ?? 1} />
-        </Animated.View>
-        <Text style={styles.playerDiceText}>{isThisDiceRolling ? '...' : displayValue ? String(displayValue) : ''}</Text>
-      </Pressable>
+      <Animated.View
+        style={isThisDiceRolling ? { transform: [{ rotate: rollingRotate }, { scale: 1.12 }] } : undefined}
+      >
+        <PremiumDiceFace
+          disabled={!canRoll}
+          isRolling={isThisDiceRolling}
+          onPress={onRoll}
+          value={displayValue ?? 1}
+        />
+      </Animated.View>
     </Animated.View>
   );
 }
@@ -870,15 +851,25 @@ function LudoBoard({
   );
 
   return (
-    <ImageBackground
-      source={boardImage}
-      resizeMode="stretch"
+    <View
       style={{
         ...styles.board,
         height: boardWidth,
         width: boardWidth,
       }}
     >
+      <LudoBoardGrid boardWidth={boardWidth} playerIds={playerIds} />
+      <ImageBackground
+        source={boardImage}
+        resizeMode="stretch"
+        style={{
+          ...styles.board,
+          height: boardWidth,
+          width: boardWidth,
+          position: 'absolute',
+          opacity: 0.32,
+        }}
+      >
       {inactiveHomeTokens.map(({ col, player, row }, index) => (
         <View
           key={`${player.id}-inactive-${index}`}
@@ -900,7 +891,7 @@ function LudoBoard({
         </View>
       ))}
       {allTokens.map(({ col, row, stackIndex, stackSize, token }) => {
-        const player = findPlayer(token.playerId);
+        const player = findPlayer(token.playerId) ?? PLAYERS[0];
         const isLegal = legalTokenIds.has(token.id);
         const position = getStackedTokenPosition(row, col, stackIndex, stackSize, cellSize, token.progress === -1);
 
@@ -921,7 +912,8 @@ function LudoBoard({
           />
         );
       })}
-    </ImageBackground>
+      </ImageBackground>
+    </View>
   );
 }
 
@@ -1146,22 +1138,18 @@ function BoardToken({
       disabled={!isLegal}
       onPress={onPress}
       style={[
-        styles.token,
         styles.absoluteToken,
-        isHome ? styles.homeTokenButton : null,
         {
-          backgroundColor: playerColor,
           height: position.size,
           opacity: visibleOpacity,
           transform: [{ translateX }, { translateY }, { scale: Animated.multiply(Animated.multiply(pop, legalPulse), killHit) }],
           width: position.size,
         },
-        isLegal ? styles.legalToken : null,
       ]}
     >
-      {isLegal && <Animated.View pointerEvents="none" style={[styles.activeTokenPulse, { opacity: legalGlow }]} />}
-      <View pointerEvents="none" style={styles.tokenShine} />
-      <TokenStar color={playerColor} />
+      <PremiumToken isLegal={isLegal} playerId={token.playerId} size={position.size}>
+        <TokenStar color={playerColor} />
+      </PremiumToken>
     </AnimatedPressable>
   );
 }
@@ -1328,7 +1316,7 @@ function HomeArtBackground() {
 
 function GameBackdrop() {
   return (
-    <View pointerEvents="none" style={styles.gameBackdrop}>
+    <View pointerEvents="none" style={[styles.gameBackdrop, { backgroundColor: 'transparent' }]}>
       {Array.from({ length: 14 }, (_, index) => (
         <View
           key={`court-${index}`}
@@ -1602,7 +1590,7 @@ function PassSetupModal({
                   ]}
                 >
                   <GlassSkin />
-                  <TokenDesignPreview design={design.id} color={findPlayer(setup.token).color} />
+                  <TokenDesignPreview design={design.id} color={(findPlayer(setup.token) ?? PLAYERS[0]).color} />
                   <Text selectable style={styles.modalTinyText}>{design.label}</Text>
                   {selected && <Text style={styles.goldTick}>✓</Text>}
                 </Pressable>
@@ -1679,7 +1667,7 @@ function SavedGameModal({
 
   if (!snapshot) return null;
 
-  const activePlayer = findPlayer(snapshot.game.playerIds[snapshot.game.activePlayerIndex]);
+  const activePlayer = findPlayer(snapshot.game.playerIds[snapshot.game.activePlayerIndex]) ?? PLAYERS[0];
   const savedTime = new Date(snapshot.savedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const finishedTokens = snapshot.game.tokens.filter((token) => token.progress >= 56).length;
 
@@ -1725,10 +1713,12 @@ function SavedGameModal({
 }
 
 function WinningModal({
+  game,
   onClose,
   onNewGame,
   winnerId,
 }: {
+  game: Game;
   onClose: () => void;
   onNewGame: () => void;
   winnerId: PlayerId | null;
@@ -1756,8 +1746,16 @@ function WinningModal({
             <GlassSkin />
             <TokenStar color={winner.color} />
           </View>
-          <Text selectable style={styles.winningName}>{winner.name} PLAYER</Text>
-          <Text selectable style={styles.winningSubtitle}>All four guti reached final home.</Text>
+          <Text selectable style={styles.winningName}>
+            {game?.teamMode && game.winningTeam
+              ? getWinnerDisplayName(game, winner.id)
+              : `${winner.name} PLAYER`}
+          </Text>
+          <Text selectable style={styles.winningSubtitle}>
+            {game?.teamMode
+              ? 'All eight team tokens reached home.'
+              : 'All four tokens reached final home.'}
+          </Text>
           <Pressable onPress={onNewGame} style={styles.winningPlayAgainButton}>
             <GlassSkin />
             <Text style={styles.winningPlayAgainText}>PLAY AGAIN</Text>
@@ -2545,6 +2543,45 @@ const styles: Record<string, ImageStyle | ViewStyle | TextStyle> = {
     top: 46,
     zIndex: 20,
   },
+  playerStrip: {
+    alignSelf: 'center',
+    marginBottom: 8,
+    maxHeight: 88,
+    paddingHorizontal: 8,
+  },
+  iconBtn: {
+    alignItems: 'center',
+    backgroundColor: colors.glass,
+    borderColor: colors.glassBorder,
+    borderRadius: 10,
+    borderWidth: 1,
+    height: 40,
+    justifyContent: 'center',
+    marginLeft: 6,
+    width: 40,
+  },
+  iconBtnText: {
+    color: colors.gold,
+    fontSize: 18,
+  },
+  gameMessageBanner: {
+    alignSelf: 'center',
+    backgroundColor: 'rgba(8, 24, 58, 0.88)',
+    borderColor: colors.gold,
+    borderRadius: 10,
+    borderWidth: 2,
+    marginTop: 96,
+    maxWidth: '94%',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    zIndex: 18,
+  },
+  gameMessageText: {
+    color: colors.gold,
+    fontSize: 13,
+    fontWeight: '900',
+    textAlign: 'center',
+  },
   gameRoot: {
     backgroundColor: '#02040B',
     flex: 1,
@@ -2555,7 +2592,7 @@ const styles: Record<string, ImageStyle | ViewStyle | TextStyle> = {
     fontWeight: '800',
   },
   gameTitle: {
-    color: '#FFFFFF',
+    color: colors.gold,
     fontSize: 28,
     fontWeight: '900',
   },

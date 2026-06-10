@@ -1,4 +1,5 @@
 export type PlayerId = 'red' | 'green' | 'yellow' | 'blue';
+export type TeamId = 'red-yellow' | 'green-blue';
 export type Coord = [number, number];
 export type Phase = 'roll' | 'move' | 'done';
 
@@ -28,6 +29,8 @@ export type Game = {
   dice: number | null;
   phase: Phase;
   winner: PlayerId | null;
+  winningTeam: TeamId | null;
+  teamMode: boolean;
   log: string[];
 };
 
@@ -49,13 +52,27 @@ export const SAFE_GLOBAL_INDEXES: Set<number>;
 
 export function orderPlayerIds(playerCount: number, firstPlayer?: PlayerId): PlayerId[];
 export function makeTokens(playerIds: PlayerId[]): Token[];
-export function createGame(playerCount?: number, firstPlayer?: PlayerId): Game;
-export function resetGame(playerCount?: number, firstPlayer?: PlayerId): Game;
-export function findPlayer(playerId: PlayerId): Player;
+export function createGame(
+  playerCount?: number,
+  firstPlayer?: PlayerId,
+  options?: { teamMode?: boolean },
+): Game;
+export function resetGame(
+  playerCount?: number,
+  firstPlayer?: PlayerId,
+  options?: { teamMode?: boolean },
+): Game;
+export function normalizeGame(game: Game): Game;
+export function findPlayer(playerId: PlayerId): Player | undefined;
 export function coordKey(coord: Coord): string;
 export function getGlobalIndex(token: Token): number;
 export function getTokenCoord(token: Token): Coord;
 export function isTrackProgress(progress: number): boolean;
+export function isTeammate(a: PlayerId, b: PlayerId): boolean;
+export function isTeamOpponent(a: PlayerId, b: PlayerId): boolean;
+export function isCaptureTarget(game: Game, moverPlayerId: PlayerId, targetToken: Token): boolean;
+export function teamAllTokensFinished(game: Game, teamId: TeamId): boolean;
+export function getWinningTeamIfAny(game: Game): TeamId | null;
 export function nextTurn(game: Game): Game;
 export function nextActiveIndex(game: Game): number;
 export function getBlockedTrackKeys(game: Game): Map<string, PlayerId>;
@@ -71,3 +88,4 @@ export function moveToken(game: Game, tokenId: string): Game;
 export function chooseCpuToken(game: Game): string | undefined;
 export function buildCellMap(tokens: Token[]): Map<string, Token[]>;
 export function getCellMeta(row: number, col: number): CellMeta;
+export function getTeamLabel(teamId: TeamId): string;

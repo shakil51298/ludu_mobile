@@ -5,7 +5,14 @@ import {
   SAFE_GLOBAL_INDEXES,
   TOKEN_COUNT,
   TRACK,
-} from './ludoConfig';
+} from './ludoConfig.js';
+import {
+  getTeamLabel,
+  getTeamPlayerIds,
+  isTeammate,
+  isTeamOpponent,
+  TEAM_BY_PLAYER,
+} from './teams.js';
 
 const OPPOSITE_PLAYERS = {
   red: 'yellow',
@@ -22,13 +29,14 @@ export {
   HOME_CELLS,
   PLAYERS,
   SAFE_GLOBAL_INDEXES,
-} from './ludoConfig';
+} from './ludoConfig.js';
+
+export { isTeammate, isTeamOpponent, TEAM_BY_PLAYER, getTeamLabel } from './teams.js';
 
 export function orderPlayerIds(playerCount, firstPlayer = 'red') {
   const count = Math.max(2, Math.min(4, playerCount));
   const first = BOARD_PLAYER_ORDER.includes(firstPlayer) ? firstPlayer : 'red';
 
-  // Rule: two-player games should use opposite board corners, not adjacent colors.
   if (count === 2) return [first, OPPOSITE_PLAYERS[first]];
 
   const ids = BOARD_PLAYER_ORDER;
@@ -48,8 +56,15 @@ export function makeTokens(playerIds) {
   );
 }
 
-export function createGame(playerCount = 4, firstPlayer = 'red') {
-  const playerIds = orderPlayerIds(playerCount, firstPlayer);
+/**
+ * @param {number} playerCount
+ * @param {import('./ludoEngine').PlayerId} [firstPlayer]
+ * @param {{ teamMode?: boolean }} [options]
+ */
+export function createGame(playerCount = 4, firstPlayer = 'red', options = {}) {
+  const teamMode = Boolean(options.teamMode);
+  const count = teamMode ? 4 : playerCount;
+  const playerIds = orderPlayerIds(count, firstPlayer);
 
   return {
     playerIds,
@@ -58,13 +73,19 @@ export function createGame(playerCount = 4, firstPlayer = 'red') {
     dice: null,
     phase: 'roll',
     winner: null,
+    winningTeam: null,
+    teamMode,
     consecutiveSixes: 0,
-    log: ['Match started. Roll a six to bring a token out.'],
+    log: [
+      teamMode
+        ? 'Team match started. Red+Yellow vs Green+Blue.'
+        : 'Match started. Roll a six to bring a token out.',
+    ],
   };
 }
 
-export function resetGame(playerCount = 4, firstPlayer = 'red') {
-  return createGame(playerCount, firstPlayer);
+export function resetGame(playerCount = 4, firstPlayer = 'red', options = {}) {
+  return createGame(playerCount, firstPlayer, options);
 }
 
 export function findPlayer(playerId) {
@@ -90,6 +111,26 @@ export function getTokenCoord(token) {
 
 export function isTrackProgress(progress) {
   return progress >= 0 && progress <= 51;
+}
+
+export function isCaptureTarget(game, moverPlayerId, targetToken) {
+  if (targetToken.playerId === moverPlayerId) return false;
+  if (game.teamMode && isTeammate(moverPlayerId, targetToken.playerId)) return false;
+  return true;
+}
+
+export function teamAllTokensFinished(game, teamId) {
+  const ids = getTeamPlayerIds(teamId);
+  return game.tokens
+    .filter((token) => ids.includes(token.playerId))
+    .every((token) => token.progress === FINISH_PROGRESS);
+}
+
+export function getWinningTeamIfAny(game) {
+  if (!game.teamMode) return null;
+  if (teamAllTokensFinished(game, 'red-yellow')) return 'red-yellow';
+  if (teamAllTokensFinished(game, 'green-blue')) return 'green-blue';
+  return null;
 }
 
 export function nextTurn(game) {
@@ -132,7 +173,10 @@ export function isBlockedByOpponent(game, token, progress) {
   const movedToken = { ...token, progress };
   const blockOwner = getBlockedTrackKeys(game).get(coordKey(getTokenCoord(movedToken)));
 
-  return Boolean(blockOwner && blockOwner !== token.playerId);
+  if (!blockOwner || blockOwner === token.playerId) return false;
+  if (game.teamMode && isTeammate(token.playerId, blockOwner)) return false;
+
+  return true;
 }
 
 export function pathCrossesOpponentBlock(game, token, roll) {
@@ -147,16 +191,9 @@ export function pathCrossesOpponentBlock(game, token, roll) {
 }
 
 export function canMoveToken(game, token, roll) {
-  // Rule: finished tokens never move again.
   if (token.progress === FINISH_PROGRESS) return false;
-
-  // Rule: a token can leave home only on a six.
   if (token.progress === -1) return roll === 6 && !isBlockedByOpponent(game, token, 0);
-
-  // Rule: the final home cell must be reached by exact dice value.
   if (token.progress + roll > FINISH_PROGRESS) return false;
-
-  // Rule: blocked spaces made by two same-color pieces cannot be landed on or passed by opponents.
   return !pathCrossesOpponentBlock(game, token, roll);
 }
 
@@ -177,18 +214,13 @@ export function getFirstHomeTokenToLaunch(game) {
   const activePlayerId = game.playerIds[game.activePlayerIndex];
   const activeTokens = game.tokens.filter((token) => token.playerId === activePlayerId);
 
-  // Rule: when all tokens are still at home and a six is rolled, one home token can start.
   if (game.dice !== 6 || !activeTokens.every((token) => token.progress === -1)) return undefined;
   return getMovableTokens(game).find((token) => token.progress === -1)?.id;
 }
 
 export function getAutoMoveTokenId(game) {
   const movableTokens = getMovableTokens(game);
-
-  // Rule: if there is only one legal token, move it automatically.
   if (movableTokens.length === 1) return movableTokens[0].id;
-
-  // Rule: at the start, a six can launch one identical home token automatically.
   return getFirstHomeTokenToLaunch(game);
 }
 
@@ -199,7 +231,6 @@ export function rollDice(game, forcedRoll) {
   const activePlayer = findPlayer(game.playerIds[game.activePlayerIndex]);
   const consecutiveSixes = dice === 6 ? (game.consecutiveSixes ?? 0) + 1 : 0;
 
-  // Rule: three sixes in a row loses the turn.
   if (consecutiveSixes >= 3) {
     const passedGame = nextTurn({ ...game, consecutiveSixes, dice });
     const nextPlayer = findPlayer(passedGame.playerIds[passedGame.activePlayerIndex]);
@@ -222,7 +253,6 @@ export function rollDice(game, forcedRoll) {
   };
   const legalMoves = getMovableTokens(nextGame);
 
-  // Rule: if no token can move after a roll, the turn passes immediately.
   if (!legalMoves.length) {
     const passedGame = nextTurn(nextGame);
     const nextPlayer = findPlayer(passedGame.playerIds[passedGame.activePlayerIndex]);
@@ -239,10 +269,33 @@ export function rollDice(game, forcedRoll) {
   return nextGame;
 }
 
+export function resolveWinner(game, lastMoverPlayerId) {
+  if (game.teamMode) {
+    const winningTeam = getWinningTeamIfAny(game);
+    if (winningTeam) {
+      return {
+        winner: lastMoverPlayerId,
+        winningTeam,
+        phase: 'done',
+      };
+    }
+    return { winner: null, winningTeam: null, phase: 'roll' };
+  }
+
+  const playerFinished = game.tokens
+    .filter((token) => token.playerId === lastMoverPlayerId)
+    .every((token) => token.progress === FINISH_PROGRESS);
+
+  if (playerFinished) {
+    return { winner: lastMoverPlayerId, winningTeam: null, phase: 'done' };
+  }
+
+  return { winner: null, winningTeam: null, phase: 'roll' };
+}
+
 export function moveToken(game, tokenId) {
   const legalTokenIds = getLegalTokenIds(game);
 
-  // Invalid moves are ignored: no dice roll, opponent token, finished token, or inexact home value.
   if (!legalTokenIds.has(tokenId) || game.winner) return game;
 
   const movingToken = game.tokens.find((token) => token.id === tokenId);
@@ -257,24 +310,22 @@ export function moveToken(game, tokenId) {
   const updatedTokens = game.tokens.map((token) => {
     if (token.id === tokenId) return movedToken;
 
-    const opponentTokensOnTarget = game.tokens.filter(
+    const sameColorOnTarget = game.tokens.filter(
       (other) =>
         other.playerId === token.playerId &&
         isTrackProgress(other.progress) &&
         coordKey(getTokenCoord(other)) === targetKey,
     );
 
-    // Rule: same-color tokens, home/final-lane tokens, safe-star cells, and blocked pairs cannot be captured.
     if (
-      token.playerId === movingToken.playerId ||
+      !isCaptureTarget(game, movingToken.playerId, token) ||
       !isTrackProgress(token.progress) ||
       isSafe ||
-      opponentTokensOnTarget.length >= 2
+      sameColorOnTarget.length >= 2
     ) {
       return token;
     }
 
-    // Rule: landing on an opponent token sends that token back home.
     if (coordKey(getTokenCoord(token)) === targetKey) {
       capturedIds.push(token.id);
       return { ...token, progress: -1 };
@@ -283,14 +334,11 @@ export function moveToken(game, tokenId) {
     return token;
   });
 
-  const playerFinished = updatedTokens
-    .filter((token) => token.playerId === activePlayer.id)
-    .every((token) => token.progress === FINISH_PROGRESS);
+  const tokensGame = { ...game, tokens: updatedTokens };
   const reachedHome = nextProgress === FINISH_PROGRESS;
-
-  // Rule: rolling a six, capturing an opponent, or reaching final home grants another dice roll.
+  const winState = resolveWinner(tokensGame, movingToken.playerId);
   const getsExtraTurn = game.dice === 6 || capturedIds.length > 0 || reachedHome;
-  const nextIndex = getsExtraTurn ? game.activePlayerIndex : nextActiveIndex(game);
+  const nextIndex = getsExtraTurn && !winState.winner ? game.activePlayerIndex : nextActiveIndex(game);
   const nextPlayer = findPlayer(game.playerIds[nextIndex]);
   const outcome = movingToken.progress === -1
     ? 'entered the board'
@@ -299,44 +347,106 @@ export function moveToken(game, tokenId) {
       : `moved ${game.dice}`;
   const captureText = capturedIds.length ? ` and captured ${capturedIds.length}` : '';
 
+  const winMessage = winState.winningTeam
+    ? `${getTeamLabel(winState.winningTeam)} wins the match.`
+    : winState.winner
+      ? `${activePlayer.name} wins the match.`
+      : `${activePlayer.name} ${outcome}${captureText}. ${nextPlayer.name} is up${getsExtraTurn ? ' again' : ''}.`;
+
   return {
-    ...game,
-    tokens: updatedTokens,
-    activePlayerIndex: nextIndex,
-    consecutiveSixes: getsExtraTurn ? game.consecutiveSixes : 0,
+    ...tokensGame,
+    activePlayerIndex: winState.winner ? game.activePlayerIndex : nextIndex,
+    consecutiveSixes: getsExtraTurn && !winState.winner ? game.consecutiveSixes : 0,
     dice: null,
-    phase: playerFinished ? 'done' : 'roll',
-    winner: playerFinished ? activePlayer.id : null,
-    log: [
-      playerFinished
-        ? `${activePlayer.name} wins the match.`
-        : `${activePlayer.name} ${outcome}${captureText}. ${nextPlayer.name} is up${getsExtraTurn ? ' again' : ''}.`,
-      ...game.log,
-    ].slice(0, 8),
+    phase: winState.phase,
+    winner: winState.winner,
+    winningTeam: winState.winningTeam,
+    log: [winMessage, ...game.log].slice(0, 8),
   };
+}
+
+function simulateMove(game, token, roll = game.dice) {
+  const nextProgress = token.progress === -1 ? 0 : token.progress + roll;
+  return { ...token, progress: nextProgress };
+}
+
+function wouldCapture(game, token, roll) {
+  const moved = simulateMove(game, token, roll);
+  if (!isTrackProgress(moved.progress)) return false;
+  const targetKey = coordKey(getTokenCoord(moved));
+  const safe = SAFE_GLOBAL_INDEXES.has(getGlobalIndex(moved));
+  if (safe) return false;
+
+  return game.tokens.some(
+    (other) =>
+      isCaptureTarget(game, token.playerId, other) &&
+      isTrackProgress(other.progress) &&
+      coordKey(getTokenCoord(other)) === targetKey,
+  );
+}
+
+function wouldWin(game, token, roll) {
+  if (game.teamMode) {
+    const moved = simulateMove(game, token, roll);
+    const trial = {
+      ...game,
+      tokens: game.tokens.map((t) => (t.id === token.id ? moved : t)),
+    };
+    return Boolean(getWinningTeamIfAny(trial));
+  }
+  return token.progress + roll === FINISH_PROGRESS &&
+    game.tokens
+      .filter((t) => t.playerId === token.playerId && t.id !== token.id)
+      .every((t) => t.progress === FINISH_PROGRESS);
+}
+
+function isInDanger(game, token) {
+  if (!isTrackProgress(token.progress)) return false;
+  const key = coordKey(getTokenCoord(token));
+  const opponentIds = game.teamMode
+    ? game.playerIds.filter((id) => isTeamOpponent(token.playerId, id))
+    : game.playerIds.filter((id) => id !== token.playerId);
+
+  for (const oppId of opponentIds) {
+    for (const oppToken of game.tokens.filter((t) => t.playerId === oppId && isTrackProgress(t.progress))) {
+      for (let roll = 1; roll <= 6; roll += 1) {
+        const moved = simulateMove(game, oppToken, roll);
+        if (isTrackProgress(moved.progress) && coordKey(getTokenCoord(moved)) === key) {
+          const landingSafe = SAFE_GLOBAL_INDEXES.has(getGlobalIndex(moved));
+          if (!landingSafe) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function landsOnSafe(game, token, roll) {
+  const moved = simulateMove(game, token, roll);
+  return isTrackProgress(moved.progress) && SAFE_GLOBAL_INDEXES.has(getGlobalIndex(moved));
+}
+
+function scoreToken(game, token) {
+  const roll = game.dice;
+  if (wouldWin(game, token, roll)) return 1000;
+  if (wouldCapture(game, token, roll)) return 500;
+  if (isInDanger(game, token) && !wouldCapture(game, token, roll)) {
+    const escaped = simulateMove(game, token, roll);
+    if (!isInDanger({ ...game, tokens: game.tokens.map((t) => (t.id === token.id ? escaped : t)) }, escaped)) {
+      return 300;
+    }
+  }
+  if (landsOnSafe(game, token, roll)) return 200;
+  if (token.progress === -1 && roll === 6) return 150;
+  return token.progress;
 }
 
 export function chooseCpuToken(game) {
   const legalTokens = getMovableTokens(game);
-  const currentPlayerId = game.playerIds[game.activePlayerIndex];
+  if (!legalTokens.length) return undefined;
 
-  const capture = legalTokens.find((token) => {
-    const moved = { ...token, progress: token.progress === -1 ? 0 : token.progress + game.dice };
-    if (!isTrackProgress(moved.progress)) return false;
-    const targetKey = coordKey(getTokenCoord(moved));
-    const safe = SAFE_GLOBAL_INDEXES.has(getGlobalIndex(moved));
-    return !safe && game.tokens.some(
-      (other) =>
-        other.playerId !== currentPlayerId &&
-        isTrackProgress(other.progress) &&
-        coordKey(getTokenCoord(other)) === targetKey,
-    );
-  });
-
-  return capture?.id
-    ?? legalTokens.find((token) => token.progress + game.dice === FINISH_PROGRESS)?.id
-    ?? legalTokens.find((token) => token.progress === -1)?.id
-    ?? legalTokens.sort((a, b) => b.progress - a.progress)[0]?.id;
+  const ranked = [...legalTokens].sort((a, b) => scoreToken(game, b) - scoreToken(game, a));
+  return ranked[0]?.id;
 }
 
 export function buildCellMap(tokens) {
@@ -372,5 +482,17 @@ export function getCellMeta(row, col) {
     homePlayer,
     isCenter: row >= 6 && row <= 8 && col >= 6 && col <= 8,
     isCenterLabel: row === 7 && col === 7,
+  };
+}
+
+/** Migrate saves from before team fields existed. */
+export function normalizeGame(game) {
+  if (!game?.tokens) return createGame(4);
+  return {
+    ...createGame(4),
+    ...game,
+    teamMode: Boolean(game.teamMode),
+    winningTeam: game.winningTeam ?? null,
+    consecutiveSixes: game.consecutiveSixes ?? 0,
   };
 }
